@@ -13,7 +13,7 @@
 extern "C" {
 #endif
 
-#define AIS_ABI_VERSION 2u
+#define AIS_ABI_VERSION 3u
 
 typedef enum ais_result {
     AIS_OK = 0,
@@ -25,7 +25,8 @@ typedef enum ais_result {
     AIS_ERROR_INVALID_STATE = -6,
     AIS_ERROR_JVM_ALREADY_USED = -7,
     AIS_ERROR_ALLOCATION_FAILED = -8,
-    AIS_ERROR_THREAD_CREATE_FAILED = -9
+    AIS_ERROR_THREAD_CREATE_FAILED = -9,
+    AIS_ERROR_ENVIRONMENT_FAILED = -10
 } ais_result;
 
 typedef enum ais_jit_status {
@@ -60,7 +61,8 @@ AIS_EXPORT ais_jit_status ais_jit_get_status(void);
 AIS_EXPORT int ais_jit_is_debugged(void);
 
 /**
- * Validates java_home, loads libjli with RTLD_GLOBAL, and resolves JLI_Launch.
+ * Validates java_home, sets JAVA_HOME, loads libjli with RTLD_GLOBAL, and
+ * resolves JLI_Launch.
  * JIT must be available before this function is called.
  */
 AIS_EXPORT ais_result ais_runtime_initialize(const char *java_home);
