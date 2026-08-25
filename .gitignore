@@ -12,6 +12,7 @@ project.xcworkspace/
 /depends
 /Natives/config.h
 /ServerRuntime/build-*/
+/ServerRuntime/artifacts/
 entitlements.codesign.xml
 $null
 /temp

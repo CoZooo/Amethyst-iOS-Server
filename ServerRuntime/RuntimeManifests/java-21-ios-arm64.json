@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "runtimeId": "java-21-ios-arm64",
+  "javaVersion": "21.0.8",
+  "javaRuntimeVersion": "21.0.8-internal-adhoc.ci.openjdk-21",
+  "osName": "Darwin",
+  "architecture": "aarch64",
+  "archiveUrl": "https://assets.angelauramc.dev/openjdk/ios-arm64/jre21-ios-aarch64.zip",
+  "archiveFileName": "jre21-ios-aarch64.zip",
+  "archiveSha256": "64043966e5e67e47bd244bb1e27f52367895674699f46693703ebd9a120b73fa",
+  "archiveMember": "jre21-ios-arm64-20260708-release.tar.xz",
+  "openJdkRepository": "https://github.com/openjdk/jdk21u",
+  "openJdkRevision": "f4b3a70fa1d7a03c1d1237f85300087d4a86babf",
+  "builderRepository": "https://github.com/AngelAuraMC/angelauramc-openjdk-build",
+  "builderRevision": "4527b5a73dcf3f890b45eab4c6a91651ea28a5ea",
+  "provenance": "third-party-prebuilt-hash-pinned",
+  "license": "GPL-2.0-only WITH Classpath-exception-2.0",
+  "requiredPaths": [
+    "release",
+    "lib/libjli.dylib",
+    "lib/server/libjvm.dylib",
+    "legal/java.base/LICENSE",
+    "legal/java.base/ASSEMBLY_EXCEPTION"
+  ]
+}

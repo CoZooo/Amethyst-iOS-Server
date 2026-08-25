@@ -287,6 +287,14 @@ ais_result ais_runtime_initialize(const char *java_home)
         return AIS_ERROR_RUNTIME_NOT_FOUND;
     }
 
+    if (setenv("JAVA_HOME", java_home, 1) != 0) {
+        pthread_mutex_lock(&g_lock);
+        g_runtime_state = AIS_RUNTIME_FAILED;
+        ais_set_errno_error_locked("setenv(JAVA_HOME)");
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_ENVIRONMENT_FAILED;
+    }
+
     void *handle = dlopen(libjli_path, RTLD_NOW | RTLD_GLOBAL);
     if (handle == NULL) {
         const char *dynamic_loader_error = dlerror();
