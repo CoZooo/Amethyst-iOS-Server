@@ -22,6 +22,7 @@ set_target_properties(AmethystIOSServer PROPERTIES
 
 include(CTest)
 if(BUILD_TESTING AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    target_compile_definitions(AmethystIOSServer PRIVATE AIS_TESTING=1)
     add_executable(AmethystIOSServerTests
         Tests/amethyst_ios_server_tests.c
     )
@@ -29,4 +30,3 @@ if(BUILD_TESTING AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     target_compile_options(AmethystIOSServerTests PRIVATE -Wall -Wextra -Werror)
     add_test(NAME AmethystIOSServerTests COMMAND AmethystIOSServerTests)
 endif()
-

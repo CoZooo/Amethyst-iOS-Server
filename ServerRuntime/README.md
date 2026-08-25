@@ -12,16 +12,20 @@ details.
 
 ## Current milestone
 
-The initial implementation deliberately stops at PoC Gate 1:
+The current implementation provides the PoC Gate 2 launch seam:
 
 - stable ABI version and result/state enums;
 - executable mapping capability probe;
 - `CS_DEBUGGED` observation;
 - Java 8 and Java 11+ `libjli.dylib` discovery;
-- `RTLD_GLOBAL` loading and `JLI_Launch` symbol validation.
+- `RTLD_GLOBAL` loading and `JLI_Launch` symbol validation;
+- copied Java argv with asynchronous launch on a dedicated native thread;
+- one-JVM-per-process enforcement and observable exit status.
 
-It does not start a JVM yet. Dedicated JVM threading, console pipes, one-shot
-lifecycle enforcement, and `JLI_Launch` invocation belong to the next gate.
+Console pipes, command input, working-directory ownership, and physical-device
+HotSpot validation remain separate gates. Returning from `JLI_Launch` moves the
+runtime to a restart-required state; this Module does not promise a second JVM
+launch in the same process.
 
 ## Host verification
 
