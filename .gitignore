@@ -11,6 +11,7 @@ xcuserdata/
 project.xcworkspace/
 /depends
 /Natives/config.h
+/ServerRuntime/build-*/
 entitlements.codesign.xml
 $null
 /temp
