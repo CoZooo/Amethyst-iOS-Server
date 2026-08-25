@@ -181,9 +181,12 @@ static int ais_is_universal_handshake_result(uintptr_t result)
     /*
      * StikDebug exposes the raw little-endian register bytes as 0x690000E0,
      * while JITserver may decode the same P0 payload as the numeric value
-     * 0xE0000069. Both values identify universal.js's legacy handshake.
+     * 0xE0000069. Some debugserver implementations only update w0 and leave
+     * x0's upper 32 bits undefined, so the handshake ABI must only inspect
+     * the low 32 bits.
      */
-    return result == AIS_UNIVERSAL_LEGACY_SENTINEL || result == (uintptr_t)0xE0000069u;
+    const uint32_t handshake = (uint32_t)result;
+    return handshake == (uint32_t)AIS_UNIVERSAL_LEGACY_SENTINEL || handshake == UINT32_C(0xE0000069);
 }
 
 static void ais_set_error_locked(const char *message)

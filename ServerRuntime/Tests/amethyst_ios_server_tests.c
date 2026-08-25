@@ -197,6 +197,20 @@ static void test_universal_jit_prepare_accepts_jitserver_register_encoding(void)
     assert(ais_test_detach_was_configured() != 0);
 }
 
+static void test_universal_jit_prepare_ignores_undefined_x0_upper_bits(void)
+{
+    ais_test_reset();
+    if (ais_jit_probe() != AIS_OK) {
+        return;
+    }
+    ais_test_configure_universal_jit(1, 1, UINT64_C(0xCCCCCCCC690000E0));
+
+    assert(ais_jit_prepare() == AIS_OK);
+    assert(ais_jit_get_status() == AIS_JIT_PREPARED);
+    assert(ais_test_universal_script_was_sent() != 0);
+    assert(ais_test_detach_was_configured() != 0);
+}
+
 static void test_missing_runtime_is_reported_after_successful_jit_probe(void)
 {
     ais_test_reset();
@@ -274,6 +288,7 @@ int main(void)
     test_universal_jit_prepare_rejects_the_wrong_script();
     test_universal_jit_prepare_installs_the_hotspot_extension();
     test_universal_jit_prepare_accepts_jitserver_register_encoding();
+    test_universal_jit_prepare_ignores_undefined_x0_upper_bits();
     test_missing_runtime_is_reported_after_successful_jit_probe();
     test_java_start_requires_initialized_runtime();
     test_java_start_copies_arguments_and_enforces_one_shot_lifecycle();
