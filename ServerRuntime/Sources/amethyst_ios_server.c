@@ -176,6 +176,16 @@ static void ais_configure_detach_after_first_breakpoint(void)
 #endif
 }
 
+static int ais_is_universal_handshake_result(uintptr_t result)
+{
+    /*
+     * StikDebug exposes the raw little-endian register bytes as 0x690000E0,
+     * while JITserver may decode the same P0 payload as the numeric value
+     * 0xE0000069. Both values identify universal.js's legacy handshake.
+     */
+    return result == AIS_UNIVERSAL_LEGACY_SENTINEL || result == (uintptr_t)0xE0000069u;
+}
+
 static void ais_set_error_locked(const char *message)
 {
     if (message == NULL) {
@@ -482,11 +492,15 @@ ais_result ais_jit_prepare(void)
     }
 
     void *handshake_result = ais_run_legacy_jit_handshake((size_t)page_size);
-    if ((uintptr_t)handshake_result != AIS_UNIVERSAL_LEGACY_SENTINEL) {
+    uintptr_t handshake_value = (uintptr_t)handshake_result;
+    if (!ais_is_universal_handshake_result(handshake_value)) {
         pthread_mutex_lock(&g_lock);
         g_runtime_state = AIS_RUNTIME_JIT_REQUIRED;
-        ais_set_error_locked(
-            "Universal JIT handshake failed. Attach with universal.js before starting Java.");
+        (void)snprintf(
+            g_last_error,
+            sizeof(g_last_error),
+            "Universal JIT handshake failed (x0=0x%llx). Attach with universal.js before starting Java.",
+            (unsigned long long)handshake_value);
         pthread_mutex_unlock(&g_lock);
         return AIS_ERROR_JIT_PREPARATION_FAILED;
     }
