@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -14,7 +15,7 @@
 typedef int (*ais_csops_fn)(int pid, unsigned int operations, void *user_address, size_t user_size);
 typedef int (*ais_jli_launch_fn)(
     int argc,
-    const char **argv,
+    char **argv,
     int jargc,
     const char **jargv,
     int appclassc,
@@ -28,11 +29,20 @@ typedef int (*ais_jli_launch_fn)(
     unsigned char javaw,
     int ergo);
 
+typedef struct ais_launch_context {
+    int argc;
+    char **argv;
+    ais_jli_launch_fn launch;
+} ais_launch_context;
+
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static ais_jit_status g_jit_status = AIS_JIT_UNKNOWN;
 static ais_runtime_state g_runtime_state = AIS_RUNTIME_UNINITIALIZED;
 static void *g_libjli_handle = NULL;
 static ais_jli_launch_fn g_jli_launch = NULL;
+static int g_jvm_started = 0;
+static int g_java_exited = 0;
+static int g_java_exit_code = 0;
 static char g_last_error[512] = "";
 
 static void ais_set_error_locked(const char *message)
@@ -74,6 +84,87 @@ static int ais_find_libjli(const char *java_home, char *destination, size_t dest
     return 0;
 }
 
+static void ais_free_launch_context(ais_launch_context *context)
+{
+    if (context == NULL) {
+        return;
+    }
+
+    if (context->argv != NULL) {
+        for (int index = 0; index < context->argc; ++index) {
+            free(context->argv[index]);
+        }
+        free(context->argv);
+    }
+    free(context);
+}
+
+static ais_launch_context *ais_copy_launch_context(
+    int argc,
+    const char *const *argv,
+    ais_jli_launch_fn launch)
+{
+    ais_launch_context *context = calloc(1, sizeof(*context));
+    if (context == NULL) {
+        return NULL;
+    }
+
+    context->argc = argc;
+    context->launch = launch;
+    context->argv = calloc((size_t)argc + 1u, sizeof(*context->argv));
+    if (context->argv == NULL) {
+        ais_free_launch_context(context);
+        return NULL;
+    }
+
+    for (int index = 0; index < argc; ++index) {
+        size_t length = strlen(argv[index]);
+        context->argv[index] = malloc(length + 1u);
+        if (context->argv[index] == NULL) {
+            ais_free_launch_context(context);
+            return NULL;
+        }
+        memcpy(context->argv[index], argv[index], length + 1u);
+    }
+
+    return context;
+}
+
+static void *ais_java_launch_thread(void *argument)
+{
+    ais_launch_context *context = argument;
+
+    pthread_mutex_lock(&g_lock);
+    g_runtime_state = AIS_RUNTIME_RUNNING;
+    pthread_mutex_unlock(&g_lock);
+
+    int exit_code = context->launch(
+        context->argc,
+        context->argv,
+        0,
+        NULL,
+        0,
+        NULL,
+        "1.8.0-internal",
+        "1.8",
+        "java",
+        "openjdk",
+        0,
+        1,
+        0,
+        1);
+
+    ais_free_launch_context(context);
+
+    pthread_mutex_lock(&g_lock);
+    g_java_exit_code = exit_code;
+    g_java_exited = 1;
+    g_runtime_state = AIS_RUNTIME_RESTART_REQUIRED;
+    ais_set_error_locked(NULL);
+    pthread_mutex_unlock(&g_lock);
+    return NULL;
+}
+
 uint32_t ais_abi_version(void)
 {
     return AIS_ABI_VERSION;
@@ -81,6 +172,14 @@ uint32_t ais_abi_version(void)
 
 ais_result ais_jit_probe(void)
 {
+    pthread_mutex_lock(&g_lock);
+    if (g_jvm_started) {
+        ais_set_error_locked("JIT capability cannot be probed after the JVM launch has started.");
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_INVALID_STATE;
+    }
+    pthread_mutex_unlock(&g_lock);
+
     long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) {
         pthread_mutex_lock(&g_lock);
@@ -166,7 +265,7 @@ ais_result ais_runtime_initialize(const char *java_home)
     }
 
     pthread_mutex_lock(&g_lock);
-    if (g_runtime_state == AIS_RUNTIME_READY) {
+    if (g_runtime_state == AIS_RUNTIME_READY || g_jvm_started) {
         ais_set_error_locked("The Java runtime is already initialized.");
         pthread_mutex_unlock(&g_lock);
         return AIS_ERROR_INVALID_STATE;
@@ -233,8 +332,150 @@ int ais_runtime_jli_launch_available(void)
     return available;
 }
 
+ais_result ais_java_start(int argc, const char *const *argv)
+{
+    if (argc <= 0 || argv == NULL || argv[0] == NULL || argv[0][0] == '\0') {
+        pthread_mutex_lock(&g_lock);
+        ais_set_error_locked("argc must be positive and argv[0] must be a non-empty launcher name.");
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_INVALID_ARGUMENT;
+    }
+
+    for (int index = 0; index < argc; ++index) {
+        if (argv[index] == NULL) {
+            pthread_mutex_lock(&g_lock);
+            ais_set_error_locked("argv entries must not be null.");
+            pthread_mutex_unlock(&g_lock);
+            return AIS_ERROR_INVALID_ARGUMENT;
+        }
+    }
+
+    pthread_mutex_lock(&g_lock);
+    if (g_jvm_started) {
+        ais_set_error_locked("A JVM has already been launched in this process; restart is required.");
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_JVM_ALREADY_USED;
+    }
+    if (g_runtime_state != AIS_RUNTIME_READY || g_jli_launch == NULL) {
+        ais_set_error_locked("The Java runtime is not ready. Initialize libjli before starting Java.");
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_INVALID_STATE;
+    }
+    ais_jli_launch_fn launch = g_jli_launch;
+    pthread_mutex_unlock(&g_lock);
+
+    ais_launch_context *context = ais_copy_launch_context(argc, argv, launch);
+    if (context == NULL) {
+        pthread_mutex_lock(&g_lock);
+        ais_set_error_locked("Unable to copy Java launch arguments.");
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_ALLOCATION_FAILED;
+    }
+
+    pthread_mutex_lock(&g_lock);
+    if (g_jvm_started || g_runtime_state != AIS_RUNTIME_READY) {
+        ais_set_error_locked("The Java runtime state changed before launch could begin.");
+        pthread_mutex_unlock(&g_lock);
+        ais_free_launch_context(context);
+        return AIS_ERROR_INVALID_STATE;
+    }
+    g_jvm_started = 1;
+    g_java_exited = 0;
+    g_java_exit_code = 0;
+    g_runtime_state = AIS_RUNTIME_STARTING;
+    ais_set_error_locked(NULL);
+    pthread_mutex_unlock(&g_lock);
+
+    pthread_t thread;
+    int thread_result = pthread_create(&thread, NULL, ais_java_launch_thread, context);
+    if (thread_result != 0) {
+        ais_free_launch_context(context);
+        pthread_mutex_lock(&g_lock);
+        g_jvm_started = 0;
+        g_runtime_state = AIS_RUNTIME_READY;
+        (void)snprintf(
+            g_last_error,
+            sizeof(g_last_error),
+            "pthread_create failed: %s (%d)",
+            strerror(thread_result),
+            thread_result);
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_THREAD_CREATE_FAILED;
+    }
+
+    (void)pthread_detach(thread);
+    return AIS_OK;
+}
+
+int ais_java_is_running(void)
+{
+    pthread_mutex_lock(&g_lock);
+    int running = g_runtime_state == AIS_RUNTIME_STARTING ||
+                  g_runtime_state == AIS_RUNTIME_RUNNING;
+    pthread_mutex_unlock(&g_lock);
+    return running;
+}
+
+int ais_java_has_exited(void)
+{
+    pthread_mutex_lock(&g_lock);
+    int exited = g_java_exited;
+    pthread_mutex_unlock(&g_lock);
+    return exited;
+}
+
+ais_result ais_java_get_exit_code(int *exit_code)
+{
+    if (exit_code == NULL) {
+        pthread_mutex_lock(&g_lock);
+        ais_set_error_locked("exit_code must not be null.");
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_INVALID_ARGUMENT;
+    }
+
+    pthread_mutex_lock(&g_lock);
+    if (!g_java_exited) {
+        ais_set_error_locked("JLI_Launch has not returned yet.");
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_INVALID_STATE;
+    }
+    *exit_code = g_java_exit_code;
+    ais_set_error_locked(NULL);
+    pthread_mutex_unlock(&g_lock);
+    return AIS_OK;
+}
+
+#if defined(AIS_TESTING)
+void ais_test_reset(void)
+{
+    pthread_mutex_lock(&g_lock);
+    g_jit_status = AIS_JIT_UNKNOWN;
+    g_runtime_state = AIS_RUNTIME_UNINITIALIZED;
+    g_libjli_handle = NULL;
+    g_jli_launch = NULL;
+    g_jvm_started = 0;
+    g_java_exited = 0;
+    g_java_exit_code = 0;
+    ais_set_error_locked(NULL);
+    pthread_mutex_unlock(&g_lock);
+}
+
+void ais_test_set_runtime_ready(ais_jli_launch_fn launch)
+{
+    pthread_mutex_lock(&g_lock);
+    g_jit_status = AIS_JIT_AVAILABLE;
+    g_runtime_state = AIS_RUNTIME_READY;
+    g_libjli_handle = (void *)(uintptr_t)1u;
+    g_jli_launch = launch;
+    g_jvm_started = 0;
+    g_java_exited = 0;
+    g_java_exit_code = 0;
+    ais_set_error_locked(NULL);
+    pthread_mutex_unlock(&g_lock);
+}
+#endif
+
 const char *ais_last_error(void)
 {
     return g_last_error;
 }
-

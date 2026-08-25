@@ -13,7 +13,7 @@
 extern "C" {
 #endif
 
-#define AIS_ABI_VERSION 1u
+#define AIS_ABI_VERSION 2u
 
 typedef enum ais_result {
     AIS_OK = 0,
@@ -22,7 +22,10 @@ typedef enum ais_result {
     AIS_ERROR_RUNTIME_NOT_FOUND = -3,
     AIS_ERROR_DLOPEN_FAILED = -4,
     AIS_ERROR_JLI_SYMBOL_MISSING = -5,
-    AIS_ERROR_INVALID_STATE = -6
+    AIS_ERROR_INVALID_STATE = -6,
+    AIS_ERROR_JVM_ALREADY_USED = -7,
+    AIS_ERROR_ALLOCATION_FAILED = -8,
+    AIS_ERROR_THREAD_CREATE_FAILED = -9
 } ais_result;
 
 typedef enum ais_jit_status {
@@ -35,7 +38,10 @@ typedef enum ais_runtime_state {
     AIS_RUNTIME_UNINITIALIZED = 0,
     AIS_RUNTIME_JIT_REQUIRED = 1,
     AIS_RUNTIME_READY = 2,
-    AIS_RUNTIME_FAILED = 3
+    AIS_RUNTIME_FAILED = 3,
+    AIS_RUNTIME_STARTING = 4,
+    AIS_RUNTIME_RUNNING = 5,
+    AIS_RUNTIME_RESTART_REQUIRED = 6
 } ais_runtime_state;
 
 /** Returns the C ABI version implemented by this library. */
@@ -66,6 +72,24 @@ AIS_EXPORT ais_runtime_state ais_runtime_get_state(void);
 AIS_EXPORT int ais_runtime_jli_launch_available(void);
 
 /**
+ * Copies argv and invokes JLI_Launch asynchronously on a dedicated native
+ * thread. argv[0] must be the launcher name, normally "java".
+ *
+ * A process may call this successfully only once. After JLI_Launch returns,
+ * the runtime enters AIS_RUNTIME_RESTART_REQUIRED.
+ */
+AIS_EXPORT ais_result ais_java_start(int argc, const char *const *argv);
+
+/** Returns non-zero while the launch thread is starting or running. */
+AIS_EXPORT int ais_java_is_running(void);
+
+/** Returns non-zero after JLI_Launch has returned. */
+AIS_EXPORT int ais_java_has_exited(void);
+
+/** Copies the JLI_Launch return value to exit_code after Java has exited. */
+AIS_EXPORT ais_result ais_java_get_exit_code(int *exit_code);
+
+/**
  * Returns a process-owned UTF-8 diagnostic string.
  * The pointer remains valid until the next call that changes native state.
  */
@@ -76,4 +100,3 @@ AIS_EXPORT const char *ais_last_error(void);
 #endif
 
 #endif
-
