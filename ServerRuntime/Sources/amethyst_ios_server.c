@@ -72,6 +72,8 @@ static ais_jli_launch_fn g_jli_launch = NULL;
 static int g_jvm_started = 0;
 static int g_java_exited = 0;
 static int g_java_exit_code = 0;
+static int g_universal_debugger_pending = 0;
+static int g_universal_debugger_release_requested = 0;
 static ais_jli_launch_fn g_jli_reentry_launch = NULL;
 static int g_console_prepared = 0;
 static int g_console_stdout_read = -1;
@@ -90,6 +92,7 @@ static int g_test_is_debugged = 0;
 static uintptr_t g_test_legacy_result = AIS_UNIVERSAL_LEGACY_SENTINEL;
 static int g_test_script_sent = 0;
 static int g_test_detach_configured = -1;
+static int g_test_debugger_detach_request_count = 0;
 #endif
 
 static int ais_requires_universal_jit(void)
@@ -196,6 +199,15 @@ static void ais_keep_debugger_attached_for_hotspot_setup(void)
      * after the allocator has finished initializing.
      */
     ais_jit26_set_detach_after_first_breakpoint(0);
+#endif
+}
+
+static void ais_request_universal_debugger_detach(void)
+{
+#if defined(AIS_TESTING)
+    ++g_test_debugger_detach_request_count;
+#elif defined(__APPLE__) && defined(__aarch64__)
+    JIT26Detach();
 #endif
 }
 
@@ -767,6 +779,8 @@ ais_result ais_jit_prepare(void)
     if (!ais_requires_universal_jit()) {
         pthread_mutex_lock(&g_lock);
         g_jit_status = AIS_JIT_PREPARED;
+        g_universal_debugger_pending = 0;
+        g_universal_debugger_release_requested = 1;
         ais_set_error_locked(NULL);
         pthread_mutex_unlock(&g_lock);
         return AIS_OK;
@@ -817,6 +831,49 @@ ais_result ais_jit_prepare(void)
 
     pthread_mutex_lock(&g_lock);
     g_jit_status = AIS_JIT_PREPARED;
+    g_universal_debugger_pending = 1;
+    g_universal_debugger_release_requested = 0;
+    ais_set_error_locked(NULL);
+    pthread_mutex_unlock(&g_lock);
+    return AIS_OK;
+}
+
+ais_result ais_jit_release_debugger_after_jvm_ready(void)
+{
+    int requires_universal_jit = ais_requires_universal_jit();
+
+    pthread_mutex_lock(&g_lock);
+    if (g_jit_status != AIS_JIT_PREPARED) {
+        ais_set_error_locked("JIT must be prepared before releasing the Universal JIT debugger.");
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_INVALID_STATE;
+    }
+    if (!requires_universal_jit) {
+        ais_set_error_locked(NULL);
+        pthread_mutex_unlock(&g_lock);
+        return AIS_OK;
+    }
+    if (!g_jvm_started ||
+        (g_runtime_state != AIS_RUNTIME_RUNNING &&
+         g_runtime_state != AIS_RUNTIME_RESTART_REQUIRED)) {
+        ais_set_error_locked(
+            "The Universal JIT debugger cannot be released before the host confirms that the JVM is ready.");
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_INVALID_STATE;
+    }
+    if (!g_universal_debugger_pending || g_universal_debugger_release_requested) {
+        ais_set_error_locked(NULL);
+        pthread_mutex_unlock(&g_lock);
+        return AIS_OK;
+    }
+
+    g_universal_debugger_release_requested = 1;
+    pthread_mutex_unlock(&g_lock);
+
+    ais_request_universal_debugger_detach();
+
+    pthread_mutex_lock(&g_lock);
+    g_universal_debugger_pending = 0;
     ais_set_error_locked(NULL);
     pthread_mutex_unlock(&g_lock);
     return AIS_OK;
@@ -1043,12 +1100,15 @@ void ais_test_reset(void)
     g_jvm_started = 0;
     g_java_exited = 0;
     g_java_exit_code = 0;
+    g_universal_debugger_pending = 0;
+    g_universal_debugger_release_requested = 0;
     g_jli_reentry_launch = NULL;
     g_test_requires_universal_jit = 0;
     g_test_is_debugged = 0;
     g_test_legacy_result = AIS_UNIVERSAL_LEGACY_SENTINEL;
     g_test_script_sent = 0;
     g_test_detach_configured = -1;
+    g_test_debugger_detach_request_count = 0;
     ais_set_error_locked(NULL);
     pthread_mutex_unlock(&g_lock);
 }
@@ -1098,6 +1158,11 @@ int ais_test_universal_script_was_sent(void)
 int ais_test_detach_after_first_breakpoint(void)
 {
     return g_test_detach_configured;
+}
+
+int ais_test_debugger_detach_request_count(void)
+{
+    return g_test_debugger_detach_request_count;
 }
 #endif
 

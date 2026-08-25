@@ -14,7 +14,7 @@
 extern "C" {
 #endif
 
-#define AIS_ABI_VERSION 5u
+#define AIS_ABI_VERSION 6u
 
 typedef enum ais_result {
     AIS_OK = 0,
@@ -75,6 +75,14 @@ AIS_EXPORT int ais_jit_is_debugged(void);
  * this advances directly to AIS_JIT_PREPARED.
  */
 AIS_EXPORT ais_result ais_jit_prepare(void);
+
+/**
+ * Releases the Universal JIT debugger after the host has independently
+ * confirmed that the JVM is ready to execute application code. The call is
+ * idempotent. Calling it before Java has started is rejected because detaching
+ * during HotSpot CodeCache initialization can invalidate executable pages.
+ */
+AIS_EXPORT ais_result ais_jit_release_debugger_after_jvm_ready(void);
 
 /**
  * Validates java_home, sets JAVA_HOME, loads libjli with RTLD_GLOBAL, and

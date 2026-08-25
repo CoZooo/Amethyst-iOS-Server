@@ -30,6 +30,7 @@ void ais_test_set_reentry_launch(ais_test_jli_launch_fn launch);
 void ais_test_configure_universal_jit(int required, int debugged, uintptr_t handshake_result);
 int ais_test_universal_script_was_sent(void);
 int ais_test_detach_after_first_breakpoint(void);
+int ais_test_debugger_detach_request_count(void);
 int ais_jli_reentry_launch(int argc, char **argv);
 
 static atomic_int g_fake_launch_release;
@@ -127,6 +128,18 @@ static void wait_for_java_exit(void)
     }
 
     assert(!"Timed out waiting for the fake JLI launcher to return.");
+}
+
+static void wait_for_runtime_state(ais_runtime_state expected)
+{
+    for (int attempt = 0; attempt < 5000; ++attempt) {
+        if (ais_runtime_get_state() == expected) {
+            return;
+        }
+        sleep_one_millisecond();
+    }
+
+    assert(!"Timed out waiting for the expected runtime state.");
 }
 
 static void test_abi_version(void)
@@ -245,6 +258,34 @@ static void test_universal_jit_prepare_ignores_undefined_x0_upper_bits(void)
     assert(ais_jit_get_status() == AIS_JIT_PREPARED);
     assert(ais_test_universal_script_was_sent() != 0);
     assert(ais_test_detach_after_first_breakpoint() == 0);
+}
+
+static void test_universal_jit_debugger_is_released_after_java_is_ready(void)
+{
+    ais_test_reset();
+    if (ais_jit_probe() != AIS_OK) {
+        return;
+    }
+    ais_test_configure_universal_jit(1, 1, 0x690000E0u);
+
+    assert(ais_jit_prepare() == AIS_OK);
+    assert(ais_jit_release_debugger_after_jvm_ready() == AIS_ERROR_INVALID_STATE);
+    assert(ais_test_debugger_detach_request_count() == 0);
+
+    atomic_store_explicit(&g_fake_launch_release, 0, memory_order_release);
+    ais_test_set_runtime_ready(fake_jli_launch);
+    const char *arguments[] = { "java", "-version" };
+    assert(ais_java_start(2, arguments) == AIS_OK);
+    wait_for_runtime_state(AIS_RUNTIME_RUNNING);
+
+    assert(ais_jit_release_debugger_after_jvm_ready() == AIS_OK);
+    assert(ais_test_debugger_detach_request_count() == 1);
+
+    assert(ais_jit_release_debugger_after_jvm_ready() == AIS_OK);
+    assert(ais_test_debugger_detach_request_count() == 1);
+
+    atomic_store_explicit(&g_fake_launch_release, 1, memory_order_release);
+    wait_for_java_exit();
 }
 
 static void test_missing_runtime_is_reported_after_successful_jit_probe(void)
@@ -391,6 +432,7 @@ int main(void)
     test_universal_jit_prepare_installs_the_hotspot_extension();
     test_universal_jit_prepare_accepts_jitserver_register_encoding();
     test_universal_jit_prepare_ignores_undefined_x0_upper_bits();
+    test_universal_jit_debugger_is_released_after_java_is_ready();
     test_missing_runtime_is_reported_after_successful_jit_probe();
     test_java_start_requires_initialized_runtime();
     test_java_start_copies_arguments_and_enforces_one_shot_lifecycle();
