@@ -22,6 +22,24 @@ ctest --test-dir build-host --output-on-failure
 
 Host 测试只验证 C ABI、参数所有权和状态转换，不能替代已签名真机上的 HotSpot/JIT 验证。
 
+## Xcode Simulator
+
+原始 Runtime 的 Mach-O 平台是 `IOS`，不能直接装入 Simulator。Apple Silicon 开发机可以显式生成一个仅供调试的派生版本：
+
+```sh
+./prepare-java-runtime.sh
+./prepare-java-runtime-simulator.sh
+./build-ios-simulator.sh Debug
+```
+
+转换脚本会复制已经过 SHA-256 校验的设备 Runtime，把副本中的 Mach-O `LC_BUILD_VERSION` 改为 `IOSSIMULATOR`，然后进行临时签名。原始设备 Runtime 不会被修改。
+
+此路径可用于验证 C ABI、`JLI_Launch`、Java 逻辑和基础网络，但 Simulator 实际使用 Mac 的 CPU、内存和调度环境，不能验证真机 JIT 获取方式、entitlement、Jetsam、后台挂起、温控、耗电或真实性能。派生 Runtime 不能分发，也不能放入真机 App。
+
+OpenJDK 的 Apple launcher 会从辅助线程再次调用进程的 `main`。本模块在 iOS 构建中提供入口路由：宿主构建必须把原有入口重命名为 `ais_host_main`，并把模块提供的 `_main` 加入动态导出符号。首次调用进入宿主运行时，Java 启动期间的第二次调用进入 `JLI_Launch`。如果宿主没有完成该重命名，链接阶段会因入口符号冲突而失败；如果没有导出 `_main`，`libjli` 将无法通过 `dlsym` 找到入口。
+
+当前 Apple launcher 在 Java 主类返回后会直接结束整个宿主进程。因此服务器执行 `stop` 后 App 也会退出，不能在同一进程内再次启动 JVM。这与当前“一次 App 生命周期只启动一次 JVM”的阶段性约束一致；长期常驻 JVM 或无进程退出的生命周期需要修改并自行构建 `libjli` 后单独验证。
+
 ## 准备 Java 21 Runtime
 
 ```sh

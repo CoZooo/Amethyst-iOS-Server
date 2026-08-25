@@ -75,10 +75,12 @@ AIS_EXPORT int ais_runtime_jli_launch_available(void);
 
 /**
  * Copies argv and invokes JLI_Launch asynchronously on a dedicated native
- * thread. argv[0] must be the launcher name, normally "java".
+ * thread. argv[0] must be the absolute java launcher path under java_home.
  *
  * A process may call this successfully only once. After JLI_Launch returns,
  * the runtime enters AIS_RUNTIME_RESTART_REQUIRED.
+ * The stock Apple launcher exits the host process when the Java main returns,
+ * so an iOS host normally cannot observe that terminal state.
  */
 AIS_EXPORT ais_result ais_java_start(int argc, const char *const *argv);
 
