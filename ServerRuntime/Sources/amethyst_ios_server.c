@@ -43,6 +43,7 @@ static ais_jli_launch_fn g_jli_launch = NULL;
 static int g_jvm_started = 0;
 static int g_java_exited = 0;
 static int g_java_exit_code = 0;
+static ais_jli_launch_fn g_jli_reentry_launch = NULL;
 static char g_last_error[512] = "";
 
 static void ais_set_error_locked(const char *message)
@@ -135,6 +136,7 @@ static void *ais_java_launch_thread(void *argument)
     ais_launch_context *context = argument;
 
     pthread_mutex_lock(&g_lock);
+    g_jli_reentry_launch = context->launch;
     g_runtime_state = AIS_RUNTIME_RUNNING;
     pthread_mutex_unlock(&g_lock);
 
@@ -163,6 +165,46 @@ static void *ais_java_launch_thread(void *argument)
     ais_set_error_locked(NULL);
     pthread_mutex_unlock(&g_lock);
     return NULL;
+}
+
+/*
+ * OpenJDK's Apple launcher resolves and invokes the process main symbol from a
+ * helper pthread. apple_jli_main.cpp calls these functions on that second
+ * entry. They are intentionally not part of the public C ABI.
+ */
+int ais_jli_reentry_is_active(void)
+{
+    pthread_mutex_lock(&g_lock);
+    int active = g_jli_reentry_launch != NULL;
+    pthread_mutex_unlock(&g_lock);
+    return active;
+}
+
+int ais_jli_reentry_launch(int argc, char **argv)
+{
+    pthread_mutex_lock(&g_lock);
+    ais_jli_launch_fn launch = g_jli_reentry_launch;
+    pthread_mutex_unlock(&g_lock);
+
+    if (launch == NULL) {
+        return EXIT_FAILURE;
+    }
+
+    return launch(
+        argc,
+        argv,
+        0,
+        NULL,
+        0,
+        NULL,
+        "1.8.0-internal",
+        "1.8",
+        "java",
+        "openjdk",
+        0,
+        1,
+        0,
+        1);
 }
 
 uint32_t ais_abi_version(void)
@@ -464,6 +506,7 @@ void ais_test_reset(void)
     g_jvm_started = 0;
     g_java_exited = 0;
     g_java_exit_code = 0;
+    g_jli_reentry_launch = NULL;
     ais_set_error_locked(NULL);
     pthread_mutex_unlock(&g_lock);
 }
@@ -478,6 +521,7 @@ void ais_test_set_runtime_ready(ais_jli_launch_fn launch)
     g_jvm_started = 0;
     g_java_exited = 0;
     g_java_exit_code = 0;
+    g_jli_reentry_launch = NULL;
     ais_set_error_locked(NULL);
     pthread_mutex_unlock(&g_lock);
 }
