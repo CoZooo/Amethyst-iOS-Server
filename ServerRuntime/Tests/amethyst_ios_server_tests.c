@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 typedef int (*ais_test_jli_launch_fn)(
     int argc,
@@ -331,6 +332,53 @@ static void test_apple_jli_reentry_records_java_completion(void)
     assert(exit_code == 31);
 }
 
+static void wait_for_console_bytes(
+    ais_console_stream stream,
+    char *buffer,
+    size_t capacity,
+    const char *expected)
+{
+    for (int attempt = 0; attempt < 5000; ++attempt) {
+        int count = ais_console_read(stream, buffer, capacity - 1u);
+        assert(count >= 0);
+        if (count > 0) {
+            buffer[count] = '\0';
+            assert(strcmp(buffer, expected) == 0);
+            return;
+        }
+        sleep_one_millisecond();
+    }
+
+    assert(!"Timed out waiting for redirected console output.");
+}
+
+static void test_console_redirects_output_and_accepts_input(void)
+{
+    ais_test_reset();
+    assert(ais_console_read(AIS_CONSOLE_STDOUT, NULL, 0) == -1);
+    assert(ais_console_write(NULL, 0) == AIS_ERROR_INVALID_STATE);
+    assert(ais_console_prepare() == AIS_OK);
+    assert(ais_console_prepare() == AIS_OK);
+
+    static const char stdout_text[] = "paper stdout\n";
+    static const char stderr_text[] = "paper stderr\n";
+    assert(write(STDOUT_FILENO, stdout_text, sizeof(stdout_text) - 1u) ==
+           (ssize_t)(sizeof(stdout_text) - 1u));
+    assert(write(STDERR_FILENO, stderr_text, sizeof(stderr_text) - 1u) ==
+           (ssize_t)(sizeof(stderr_text) - 1u));
+
+    char buffer[64];
+    wait_for_console_bytes(AIS_CONSOLE_STDOUT, buffer, sizeof(buffer), stdout_text);
+    wait_for_console_bytes(AIS_CONSOLE_STDERR, buffer, sizeof(buffer), stderr_text);
+
+    static const char command[] = "stop\n";
+    assert(ais_console_write(command, sizeof(command) - 1u) == AIS_OK);
+    ssize_t input_count = read(STDIN_FILENO, buffer, sizeof(buffer) - 1u);
+    assert(input_count == (ssize_t)(sizeof(command) - 1u));
+    buffer[input_count] = '\0';
+    assert(strcmp(buffer, command) == 0);
+}
+
 int main(void)
 {
     test_abi_version();
@@ -347,6 +395,6 @@ int main(void)
     test_java_start_requires_initialized_runtime();
     test_java_start_copies_arguments_and_enforces_one_shot_lifecycle();
     test_apple_jli_reentry_records_java_completion();
-    puts("Amethyst iOS Server runtime tests passed.");
+    test_console_redirects_output_and_accepts_input();
     return 0;
 }

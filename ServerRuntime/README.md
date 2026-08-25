@@ -10,9 +10,9 @@
 
 原生库输出到 `build-ios/Debug-iphoneos/libAmethystIOSServer.a`。
 
-当前 C ABI 版本为 v4。宿主必须依次调用 `ais_jit_probe`、`ais_jit_prepare`、`ais_runtime_initialize` 和 `ais_java_start`。Bridge 在专用原生线程调用 `JLI_Launch`，并按“一次 App 进程只启动一次 JVM”约束管理状态；JVM 返回后必须重启宿主 App，不能直接再次创建 JVM。
+当前 C ABI 版本为 v5。宿主必须依次调用 `ais_jit_probe`、`ais_jit_prepare`、`ais_runtime_initialize` 和 `ais_java_start`。需要交互式 Console 时，还必须在启动 Java 前调用一次 `ais_console_prepare`。Bridge 在专用原生线程调用 `JLI_Launch`，并按“一次 App 进程只启动一次 JVM”约束管理状态；JVM 返回后必须重启宿主 App，不能直接再次创建 JVM。
 
-iOS/iPadOS 26 及以上真机需要在进程启动时使用 `universal.js` 附加 debugger。`ais_jit_prepare` 会在加载 HotSpot 前完成旧版 `brk #0x69` 探测、注入 Universal 扩展并配置首次 CodeCache 映射后分离；没有匹配脚本时会返回 `AIS_ERROR_JIT_PREPARATION_FAILED`，不会继续启动 JVM。宿主链接器必须保留并动态导出 `_DeviceHasTXM`、`_JIT26Detach` 和 `_JIT26PrepareRegion`。
+iOS/iPadOS 26 及以上真机需要在进程启动时使用 `universal.js` 附加 debugger。`ais_jit_prepare` 会在加载 HotSpot 前完成旧版 `brk #0x69` 探测并注入 Universal 扩展；当前实现会在 HotSpot 建立 CodeCache 期间保持 debugger 连接，避免过早分离导致可执行页失效。没有匹配脚本时会返回 `AIS_ERROR_JIT_PREPARATION_FAILED`，不会继续启动 JVM。宿主链接器必须保留并动态导出 `_DeviceHasTXM`、`_JIT26Detach` 和 `_JIT26PrepareRegion`。
 
 Host 状态机测试：
 
@@ -40,7 +40,18 @@ Host 测试只验证 C ABI、参数所有权和状态转换，不能替代已签
 
 OpenJDK 的 Apple launcher 会从辅助线程再次调用进程的 `main`。本模块在 iOS 构建中提供入口路由：宿主构建必须把原有入口重命名为 `ais_host_main`，并把模块提供的 `_main` 加入动态导出符号。首次调用进入宿主运行时，Java 启动期间的第二次调用进入 `JLI_Launch`。如果宿主没有完成该重命名，链接阶段会因入口符号冲突而失败；如果没有导出 `_main`，`libjli` 将无法通过 `dlsym` 找到入口。
 
-当前 Apple launcher 在 Java 主类返回后会直接结束整个宿主进程。因此服务器执行 `stop` 后 App 也会退出，不能在同一进程内再次启动 JVM。这与当前“一次 App 生命周期只启动一次 JVM”的阶段性约束一致；长期常驻 JVM 或无进程退出的生命周期需要修改并自行构建 `libjli` 后单独验证。
+Apple launcher 在 Java 主类返回后会调用 `exit`。本模块只重绑定 `libjli` 自身导入的 `exit`，让 Apple 辅助线程退出并保留宿主进程，同时记录 `JLI_Launch` 的退出码。HotSpot 仍不支持在这个进程内安全地创建第二个 JVM，因此服务器停止后仍需重启宿主 App。
+
+## Console 管道
+
+`ais_console_prepare` 会把进程的 stdin、stdout 和 stderr 接到 Runtime 管理的 pipe。宿主通过 `ais_console_read` 非阻塞读取 stdout/stderr，通过 `ais_console_write` 写入 UTF-8 命令。重定向是进程级且不可撤销，必须在 `ais_java_start` 之前完成。
+
+Console 闭环验证包使用同一条 `java -jar ... nogui` 启动路径，并同时验证 stdout、stderr、stdin、工作目录和退出码：
+
+```sh
+./build-console-probe.sh
+java -jar artifacts/validation/console-probe.jar nogui
+```
 
 ## 准备 Java 21 Runtime
 

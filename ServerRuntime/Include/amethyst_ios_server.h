@@ -1,6 +1,7 @@
 #ifndef AMETHYST_IOS_SERVER_H
 #define AMETHYST_IOS_SERVER_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #if defined(__GNUC__)
@@ -13,7 +14,7 @@
 extern "C" {
 #endif
 
-#define AIS_ABI_VERSION 4u
+#define AIS_ABI_VERSION 5u
 
 typedef enum ais_result {
     AIS_OK = 0,
@@ -27,8 +28,14 @@ typedef enum ais_result {
     AIS_ERROR_ALLOCATION_FAILED = -8,
     AIS_ERROR_THREAD_CREATE_FAILED = -9,
     AIS_ERROR_ENVIRONMENT_FAILED = -10,
-    AIS_ERROR_JIT_PREPARATION_FAILED = -11
+    AIS_ERROR_JIT_PREPARATION_FAILED = -11,
+    AIS_ERROR_CONSOLE_FAILED = -12
 } ais_result;
+
+typedef enum ais_console_stream {
+    AIS_CONSOLE_STDOUT = 1,
+    AIS_CONSOLE_STDERR = 2
+} ais_console_stream;
 
 typedef enum ais_jit_status {
     AIS_JIT_UNKNOWN = 0,
@@ -88,10 +95,26 @@ AIS_EXPORT int ais_runtime_jli_launch_available(void);
  *
  * A process may call this successfully only once. After JLI_Launch returns,
  * the runtime enters AIS_RUNTIME_RESTART_REQUIRED.
- * The stock Apple launcher exits the host process when the Java main returns,
- * so an iOS host normally cannot observe that terminal state.
+ * The runtime isolates the Apple launcher's exit() call so the iOS host can
+ * observe the terminal state without terminating the app process.
  */
 AIS_EXPORT ais_result ais_java_start(int argc, const char *const *argv);
+
+/**
+ * Redirects process stdin, stdout, and stderr through runtime-owned pipes.
+ * This must be called before ais_java_start and is idempotent. Once prepared,
+ * redirection remains active for the rest of the process lifetime.
+ */
+AIS_EXPORT ais_result ais_console_prepare(void);
+
+/**
+ * Non-blocking read from redirected stdout or stderr. Returns the number of
+ * bytes copied, zero when no bytes are available, or -1 on error.
+ */
+AIS_EXPORT int ais_console_read(ais_console_stream stream, void *buffer, size_t capacity);
+
+/** Writes raw bytes to redirected stdin. Callers append their own newline. */
+AIS_EXPORT ais_result ais_console_write(const void *bytes, size_t length);
 
 /** Returns non-zero while the launch thread is starting or running. */
 AIS_EXPORT int ais_java_is_running(void);

@@ -2,6 +2,8 @@
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -71,6 +73,10 @@ static int g_jvm_started = 0;
 static int g_java_exited = 0;
 static int g_java_exit_code = 0;
 static ais_jli_launch_fn g_jli_reentry_launch = NULL;
+static int g_console_prepared = 0;
+static int g_console_stdout_read = -1;
+static int g_console_stderr_read = -1;
+static int g_console_stdin_write = -1;
 static char g_last_error[512] = "";
 
 #if defined(__APPLE__) && TARGET_OS_IOS && !defined(AIS_TESTING)
@@ -225,6 +231,214 @@ static void ais_set_errno_error_locked(const char *operation)
         operation,
         strerror(errno),
         errno);
+}
+
+static void ais_close_fd(int *descriptor)
+{
+    if (*descriptor >= 0) {
+        (void)close(*descriptor);
+        *descriptor = -1;
+    }
+}
+
+static int ais_set_nonblocking(int descriptor)
+{
+    int flags = fcntl(descriptor, F_GETFL);
+    return flags >= 0 && fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0;
+}
+
+ais_result ais_console_prepare(void)
+{
+    pthread_mutex_lock(&g_lock);
+    if (g_console_prepared) {
+        ais_set_error_locked(NULL);
+        pthread_mutex_unlock(&g_lock);
+        return AIS_OK;
+    }
+    if (g_jvm_started) {
+        ais_set_error_locked("Console redirection must be prepared before Java starts.");
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_INVALID_STATE;
+    }
+
+    int stdout_pipe[2] = { -1, -1 };
+    int stderr_pipe[2] = { -1, -1 };
+    int stdin_pipe[2] = { -1, -1 };
+    int saved_standard[3] = { -1, -1, -1 };
+    const char *failed_operation = NULL;
+    int failure_errno = 0;
+
+    if (pipe(stdout_pipe) != 0) {
+        failed_operation = "pipe(stdout)";
+        goto fail;
+    }
+    if (pipe(stderr_pipe) != 0) {
+        failed_operation = "pipe(stderr)";
+        goto fail;
+    }
+    if (pipe(stdin_pipe) != 0) {
+        failed_operation = "pipe(stdin)";
+        goto fail;
+    }
+
+    saved_standard[0] = dup(STDIN_FILENO);
+    saved_standard[1] = dup(STDOUT_FILENO);
+    saved_standard[2] = dup(STDERR_FILENO);
+    if (saved_standard[0] < 0 || saved_standard[1] < 0 || saved_standard[2] < 0) {
+        failed_operation = "dup(stdio)";
+        goto fail;
+    }
+
+    (void)fflush(NULL);
+    if (dup2(stdin_pipe[0], STDIN_FILENO) < 0) {
+        failed_operation = "dup2(stdin)";
+        goto fail;
+    }
+    if (dup2(stdout_pipe[1], STDOUT_FILENO) < 0) {
+        failed_operation = "dup2(stdout)";
+        goto fail;
+    }
+    if (dup2(stderr_pipe[1], STDERR_FILENO) < 0) {
+        failed_operation = "dup2(stderr)";
+        goto fail;
+    }
+    if (!ais_set_nonblocking(stdout_pipe[0]) || !ais_set_nonblocking(stderr_pipe[0])) {
+        failed_operation = "fcntl(O_NONBLOCK)";
+        goto fail;
+    }
+#if defined(F_SETNOSIGPIPE)
+    if (fcntl(stdin_pipe[1], F_SETNOSIGPIPE, 1) != 0) {
+        failed_operation = "fcntl(F_SETNOSIGPIPE)";
+        goto fail;
+    }
+#endif
+
+    g_console_stdout_read = stdout_pipe[0];
+    stdout_pipe[0] = -1;
+    g_console_stderr_read = stderr_pipe[0];
+    stderr_pipe[0] = -1;
+    g_console_stdin_write = stdin_pipe[1];
+    stdin_pipe[1] = -1;
+    g_console_prepared = 1;
+
+    ais_close_fd(&stdout_pipe[1]);
+    ais_close_fd(&stderr_pipe[1]);
+    ais_close_fd(&stdin_pipe[0]);
+    for (size_t index = 0; index < 3u; ++index) {
+        ais_close_fd(&saved_standard[index]);
+    }
+    ais_set_error_locked(NULL);
+    pthread_mutex_unlock(&g_lock);
+    return AIS_OK;
+
+fail:
+    failure_errno = errno;
+    if (saved_standard[0] >= 0) {
+        (void)dup2(saved_standard[0], STDIN_FILENO);
+    }
+    if (saved_standard[1] >= 0) {
+        (void)dup2(saved_standard[1], STDOUT_FILENO);
+    }
+    if (saved_standard[2] >= 0) {
+        (void)dup2(saved_standard[2], STDERR_FILENO);
+    }
+    ais_close_fd(&stdout_pipe[0]);
+    ais_close_fd(&stdout_pipe[1]);
+    ais_close_fd(&stderr_pipe[0]);
+    ais_close_fd(&stderr_pipe[1]);
+    ais_close_fd(&stdin_pipe[0]);
+    ais_close_fd(&stdin_pipe[1]);
+    for (size_t index = 0; index < 3u; ++index) {
+        ais_close_fd(&saved_standard[index]);
+    }
+    (void)snprintf(
+        g_last_error,
+        sizeof(g_last_error),
+        "%s failed: %s (%d)",
+        failed_operation == NULL ? "console preparation" : failed_operation,
+        strerror(failure_errno),
+        failure_errno);
+    pthread_mutex_unlock(&g_lock);
+    return AIS_ERROR_CONSOLE_FAILED;
+}
+
+int ais_console_read(ais_console_stream stream, void *buffer, size_t capacity)
+{
+    if (buffer == NULL || capacity == 0 || capacity > (size_t)INT_MAX) {
+        pthread_mutex_lock(&g_lock);
+        ais_set_error_locked("Console read requires a non-empty destination buffer.");
+        pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
+
+    pthread_mutex_lock(&g_lock);
+    int descriptor = stream == AIS_CONSOLE_STDOUT
+        ? g_console_stdout_read
+        : stream == AIS_CONSOLE_STDERR ? g_console_stderr_read : -1;
+    int prepared = g_console_prepared;
+    pthread_mutex_unlock(&g_lock);
+    if (!prepared || descriptor < 0) {
+        pthread_mutex_lock(&g_lock);
+        ais_set_error_locked(
+            prepared ? "Unknown console output stream." : "Console redirection has not been prepared.");
+        pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
+
+    ssize_t count;
+    do {
+        count = read(descriptor, buffer, capacity);
+    } while (count < 0 && errno == EINTR);
+    if (count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return 0;
+    }
+    if (count < 0) {
+        pthread_mutex_lock(&g_lock);
+        ais_set_errno_error_locked("read(console)");
+        pthread_mutex_unlock(&g_lock);
+        return -1;
+    }
+
+    return (int)count;
+}
+
+ais_result ais_console_write(const void *bytes, size_t length)
+{
+    pthread_mutex_lock(&g_lock);
+    int descriptor = g_console_stdin_write;
+    int prepared = g_console_prepared;
+    if (!prepared || descriptor < 0) {
+        ais_set_error_locked("Console redirection has not been prepared.");
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_INVALID_STATE;
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    if (bytes == NULL || length == 0) {
+        pthread_mutex_lock(&g_lock);
+        ais_set_error_locked("Console write requires at least one byte.");
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_INVALID_ARGUMENT;
+    }
+
+    const unsigned char *cursor = bytes;
+    size_t remaining = length;
+    while (remaining > 0) {
+        ssize_t count = write(descriptor, cursor, remaining);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            pthread_mutex_lock(&g_lock);
+            ais_set_errno_error_locked("write(console)");
+            pthread_mutex_unlock(&g_lock);
+            return AIS_ERROR_CONSOLE_FAILED;
+        }
+        cursor += count;
+        remaining -= (size_t)count;
+    }
+
+    return AIS_OK;
 }
 
 #if defined(__APPLE__) && TARGET_OS_IOS && !defined(AIS_TESTING)
