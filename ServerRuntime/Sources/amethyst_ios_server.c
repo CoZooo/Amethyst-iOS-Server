@@ -73,7 +73,7 @@ static int g_test_requires_universal_jit = 0;
 static int g_test_is_debugged = 0;
 static uintptr_t g_test_legacy_result = AIS_UNIVERSAL_LEGACY_SENTINEL;
 static int g_test_script_sent = 0;
-static int g_test_detach_configured = 0;
+static int g_test_detach_configured = -1;
 #endif
 
 static int ais_requires_universal_jit(void)
@@ -167,12 +167,19 @@ static void ais_install_universal_jit_extension(void)
 #endif
 }
 
-static void ais_configure_detach_after_first_breakpoint(void)
+static void ais_keep_debugger_attached_for_hotspot_setup(void)
 {
 #if defined(AIS_TESTING)
-    g_test_detach_configured = 1;
+    g_test_detach_configured = 0;
 #elif defined(__APPLE__) && defined(__aarch64__)
-    ais_jit26_set_detach_after_first_breakpoint(1);
+    /*
+     * HotSpot creates its writable CodeCache alias after the debugger has
+     * prepared the RX region. Detaching inside the legacy region handler is
+     * therefore too early and iOS 27 may invalidate the executable pages.
+     * Keep the debugger attached until the runtime can explicitly detach
+     * after the allocator has finished initializing.
+     */
+    ais_jit26_set_detach_after_first_breakpoint(0);
 #endif
 }
 
@@ -509,7 +516,7 @@ ais_result ais_jit_prepare(void)
     }
 
     ais_install_universal_jit_extension();
-    ais_configure_detach_after_first_breakpoint();
+    ais_keep_debugger_attached_for_hotspot_setup();
 
     if (setenv("XNU_HAS_TXM", "1", 1) != 0) {
         pthread_mutex_lock(&g_lock);
@@ -742,7 +749,7 @@ void ais_test_reset(void)
     g_test_is_debugged = 0;
     g_test_legacy_result = AIS_UNIVERSAL_LEGACY_SENTINEL;
     g_test_script_sent = 0;
-    g_test_detach_configured = 0;
+    g_test_detach_configured = -1;
     ais_set_error_locked(NULL);
     pthread_mutex_unlock(&g_lock);
 }
@@ -777,7 +784,7 @@ int ais_test_universal_script_was_sent(void)
     return g_test_script_sent;
 }
 
-int ais_test_detach_was_configured(void)
+int ais_test_detach_after_first_breakpoint(void)
 {
     return g_test_detach_configured;
 }
