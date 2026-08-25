@@ -34,3 +34,11 @@ ctest --test-dir ServerRuntime/build-host --output-on-failure
 Host success proves the C interface and state transitions compile and run. It
 does not prove iOS JIT readiness; that requires a signed host application on a
 physical device.
+
+Build the device ARM64 static library with:
+
+```sh
+ServerRuntime/build-ios.sh Debug
+```
+
+Consumer projects may invoke this script as part of their device build.
