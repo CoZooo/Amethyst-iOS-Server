@@ -25,9 +25,11 @@ typedef int (*ais_test_jli_launch_fn)(
 
 void ais_test_reset(void);
 void ais_test_set_runtime_ready(ais_test_jli_launch_fn launch);
+void ais_test_set_reentry_launch(ais_test_jli_launch_fn launch);
 void ais_test_configure_universal_jit(int required, int debugged, uintptr_t handshake_result);
 int ais_test_universal_script_was_sent(void);
 int ais_test_detach_after_first_breakpoint(void);
+int ais_jli_reentry_launch(int argc, char **argv);
 
 static atomic_int g_fake_launch_release;
 static int g_fake_argc;
@@ -79,6 +81,39 @@ static int fake_jli_launch(
         "%s",
         argc > 1 ? argv[1] : "");
     return 23;
+}
+
+static int fake_reentry_jli_launch(
+    int argc,
+    char **argv,
+    int jargc,
+    const char **jargv,
+    int appclassc,
+    const char **appclassv,
+    const char *fullversion,
+    const char *dotversion,
+    const char *pname,
+    const char *lname,
+    unsigned char javaargs,
+    unsigned char cpwildcard,
+    unsigned char javaw,
+    int ergo)
+{
+    (void)argc;
+    (void)argv;
+    (void)jargc;
+    (void)jargv;
+    (void)appclassc;
+    (void)appclassv;
+    (void)fullversion;
+    (void)dotversion;
+    (void)pname;
+    (void)lname;
+    (void)javaargs;
+    (void)cpwildcard;
+    (void)javaw;
+    (void)ergo;
+    return 31;
 }
 
 static void wait_for_java_exit(void)
@@ -277,6 +312,25 @@ static void test_java_start_copies_arguments_and_enforces_one_shot_lifecycle(voi
     assert(ais_java_start(2, arguments) == AIS_ERROR_JVM_ALREADY_USED);
 }
 
+static void test_apple_jli_reentry_records_java_completion(void)
+{
+    ais_test_reset();
+    ais_test_set_reentry_launch(fake_reentry_jli_launch);
+
+    char launcher[] = "java";
+    char version_argument[] = "-version";
+    char *arguments[] = { launcher, version_argument };
+
+    assert(ais_jli_reentry_launch(2, arguments) == 31);
+    assert(ais_java_is_running() == 0);
+    assert(ais_java_has_exited() != 0);
+    assert(ais_runtime_get_state() == AIS_RUNTIME_RESTART_REQUIRED);
+
+    int exit_code = 0;
+    assert(ais_java_get_exit_code(&exit_code) == AIS_OK);
+    assert(exit_code == 31);
+}
+
 int main(void)
 {
     test_abi_version();
@@ -292,6 +346,7 @@ int main(void)
     test_missing_runtime_is_reported_after_successful_jit_probe();
     test_java_start_requires_initialized_runtime();
     test_java_start_copies_arguments_and_enforces_one_shot_lifecycle();
+    test_apple_jli_reentry_records_java_completion();
     puts("Amethyst iOS Server runtime tests passed.");
     return 0;
 }

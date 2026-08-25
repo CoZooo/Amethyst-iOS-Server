@@ -14,6 +14,11 @@
 #include <TargetConditionals.h>
 #endif
 
+#if defined(__APPLE__) && TARGET_OS_IOS && !defined(AIS_TESTING)
+#include <mach-o/dyld.h>
+#include "fishhook.h"
+#endif
+
 #define AIS_CS_DEBUGGED 0x10000000u
 #define AIS_CS_OPS_STATUS 0u
 #define AIS_UNIVERSAL_LEGACY_SENTINEL ((uintptr_t)0x690000E0u)
@@ -67,6 +72,11 @@ static int g_java_exited = 0;
 static int g_java_exit_code = 0;
 static ais_jli_launch_fn g_jli_reentry_launch = NULL;
 static char g_last_error[512] = "";
+
+#if defined(__APPLE__) && TARGET_OS_IOS && !defined(AIS_TESTING)
+static _Thread_local int g_is_jli_reentry_thread = 0;
+static void (*g_original_libjli_exit)(int) = NULL;
+#endif
 
 #if defined(AIS_TESTING)
 static int g_test_requires_universal_jit = 0;
@@ -217,6 +227,53 @@ static void ais_set_errno_error_locked(const char *operation)
         errno);
 }
 
+#if defined(__APPLE__) && TARGET_OS_IOS && !defined(AIS_TESTING)
+__attribute__((noreturn))
+static void ais_libjli_exit(int exit_code)
+{
+    if (g_is_jli_reentry_thread) {
+        pthread_exit((void *)(intptr_t)exit_code);
+    }
+
+    g_original_libjli_exit(exit_code);
+    __builtin_unreachable();
+}
+
+static int ais_install_libjli_exit_hook(ais_jli_launch_fn launch)
+{
+    Dl_info image_info;
+    if (dladdr((void *)(uintptr_t)launch, &image_info) == 0 || image_info.dli_fbase == NULL) {
+        return 0;
+    }
+
+    const struct mach_header *header = image_info.dli_fbase;
+    intptr_t slide = 0;
+    int image_found = 0;
+    uint32_t image_count = _dyld_image_count();
+    for (uint32_t index = 0; index < image_count; ++index) {
+        if (_dyld_get_image_header(index) == header) {
+            slide = _dyld_get_image_vmaddr_slide(index);
+            image_found = 1;
+            break;
+        }
+    }
+    if (!image_found) {
+        return 0;
+    }
+
+    struct rebinding exit_rebinding = {
+        .name = "exit",
+        .replacement = (void *)(uintptr_t)ais_libjli_exit,
+        .replaced = (void **)&g_original_libjli_exit
+    };
+    if (rebind_symbols_image((void *)header, slide, &exit_rebinding, 1) != 0) {
+        return 0;
+    }
+
+    return g_original_libjli_exit != NULL;
+}
+#endif
+
 static int ais_find_libjli(const char *java_home, char *destination, size_t destination_size)
 {
     static const char *relative_paths[] = {
@@ -281,6 +338,18 @@ static ais_launch_context *ais_copy_launch_context(
     return context;
 }
 
+static void ais_record_java_exit(int exit_code)
+{
+    pthread_mutex_lock(&g_lock);
+    if (!g_java_exited) {
+        g_java_exit_code = exit_code;
+        g_java_exited = 1;
+        g_runtime_state = AIS_RUNTIME_RESTART_REQUIRED;
+        ais_set_error_locked(NULL);
+    }
+    pthread_mutex_unlock(&g_lock);
+}
+
 static void *ais_java_launch_thread(void *argument)
 {
     ais_launch_context *context = argument;
@@ -308,12 +377,7 @@ static void *ais_java_launch_thread(void *argument)
 
     ais_free_launch_context(context);
 
-    pthread_mutex_lock(&g_lock);
-    g_java_exit_code = exit_code;
-    g_java_exited = 1;
-    g_runtime_state = AIS_RUNTIME_RESTART_REQUIRED;
-    ais_set_error_locked(NULL);
-    pthread_mutex_unlock(&g_lock);
+    ais_record_java_exit(exit_code);
     return NULL;
 }
 
@@ -340,7 +404,11 @@ int ais_jli_reentry_launch(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    return launch(
+#if defined(__APPLE__) && TARGET_OS_IOS && !defined(AIS_TESTING)
+    g_is_jli_reentry_thread = 1;
+#endif
+
+    int exit_code = launch(
         argc,
         argv,
         0,
@@ -355,6 +423,13 @@ int ais_jli_reentry_launch(int argc, char **argv)
         1,
         0,
         1);
+
+    ais_record_java_exit(exit_code);
+
+    pthread_mutex_lock(&g_lock);
+    g_jli_reentry_launch = NULL;
+    pthread_mutex_unlock(&g_lock);
+    return exit_code;
 }
 
 uint32_t ais_abi_version(void)
@@ -595,6 +670,16 @@ ais_result ais_runtime_initialize(const char *java_home)
         return AIS_ERROR_JLI_SYMBOL_MISSING;
     }
 
+#if defined(__APPLE__) && TARGET_OS_IOS && !defined(AIS_TESTING)
+    if (!ais_install_libjli_exit_hook(launch)) {
+        pthread_mutex_lock(&g_lock);
+        g_runtime_state = AIS_RUNTIME_FAILED;
+        ais_set_error_locked("Unable to isolate libjli exit() from the host process.");
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_DLOPEN_FAILED;
+    }
+#endif
+
     pthread_mutex_lock(&g_lock);
     g_libjli_handle = handle;
     g_jli_launch = launch;
@@ -765,6 +850,18 @@ void ais_test_set_runtime_ready(ais_jli_launch_fn launch)
     g_java_exited = 0;
     g_java_exit_code = 0;
     g_jli_reentry_launch = NULL;
+    ais_set_error_locked(NULL);
+    pthread_mutex_unlock(&g_lock);
+}
+
+void ais_test_set_reentry_launch(ais_jli_launch_fn launch)
+{
+    pthread_mutex_lock(&g_lock);
+    g_jli_reentry_launch = launch;
+    g_jvm_started = 1;
+    g_java_exited = 0;
+    g_java_exit_code = 0;
+    g_runtime_state = AIS_RUNTIME_RUNNING;
     ais_set_error_locked(NULL);
     pthread_mutex_unlock(&g_lock);
 }

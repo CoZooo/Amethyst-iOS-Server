@@ -13,6 +13,10 @@ add_library(AmethystIOSServer STATIC
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     target_sources(AmethystIOSServer PRIVATE
         Sources/apple_jli_main.cpp
+        ../Natives/external/fishhook/fishhook.c
+    )
+    target_include_directories(AmethystIOSServer PRIVATE
+        ../Natives/external/fishhook
     )
 endif()
 
