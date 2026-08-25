@@ -2,6 +2,7 @@
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <stdbool.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,8 +10,29 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 #define AIS_CS_DEBUGGED 0x10000000u
 #define AIS_CS_OPS_STATUS 0u
+#define AIS_UNIVERSAL_LEGACY_SENTINEL ((uintptr_t)0x690000E0u)
+
+#if !defined(AIS_TESTING)
+static const char g_universal_jit_extension[] =
+    "logLevel = LOG_INFO;\n"
+    "let detachAfterFirstBr = false;\n"
+    "legacyCommands[0x69] = function(brkResponse) {\n"
+    "    x1 = x0;\n"
+    "    x0 = 0;\n"
+    "    JIT26PrepareRegion(brkResponse);\n"
+    "    if (detachAfterFirstBr) { JIT26Detach(); }\n"
+    "};\n"
+    "commands[3] = function(brkResponse) {\n"
+    "    detachAfterFirstBr = x0 != 0;\n"
+    "    log(`JIT26SetDetachAfterFirstBr(${detachAfterFirstBr}) called`);\n"
+    "};\n";
+#endif
 
 typedef int (*ais_csops_fn)(int pid, unsigned int operations, void *user_address, size_t user_size);
 typedef int (*ais_jli_launch_fn)(
@@ -45,6 +67,114 @@ static int g_java_exited = 0;
 static int g_java_exit_code = 0;
 static ais_jli_launch_fn g_jli_reentry_launch = NULL;
 static char g_last_error[512] = "";
+
+#if defined(AIS_TESTING)
+static int g_test_requires_universal_jit = 0;
+static int g_test_is_debugged = 0;
+static uintptr_t g_test_legacy_result = AIS_UNIVERSAL_LEGACY_SENTINEL;
+static int g_test_script_sent = 0;
+static int g_test_detach_configured = 0;
+#endif
+
+static int ais_requires_universal_jit(void)
+{
+#if defined(AIS_TESTING)
+    return g_test_requires_universal_jit;
+#elif defined(__APPLE__) && TARGET_OS_IOS && !TARGET_OS_SIMULATOR
+    if (__builtin_available(iOS 26.0, *)) {
+        return 1;
+    }
+    return 0;
+#else
+    return 0;
+#endif
+}
+
+#if defined(__APPLE__) && defined(__aarch64__) && !defined(AIS_TESTING)
+__attribute__((visibility("default"), used, noinline, optnone, naked))
+void JIT26Detach(void)
+{
+    __asm__(
+        "mov x16, #0\n"
+        "brk #0xf00d\n"
+        "ret\n");
+}
+
+__attribute__((visibility("default"), used, noinline, optnone, naked))
+void *JIT26PrepareRegion(
+    void *address __attribute__((unused)),
+    size_t length __attribute__((unused)))
+{
+    __asm__(
+        "mov x16, #1\n"
+        "brk #0xf00d\n"
+        "ret\n");
+}
+
+__attribute__((noinline, optnone, naked))
+static void *ais_jit26_create_region_legacy(size_t length __attribute__((unused)))
+{
+    __asm__(
+        "brk #0x69\n"
+        "ret\n");
+}
+
+__attribute__((noinline, optnone, naked))
+static void ais_jit26_send_script(
+    const char *script __attribute__((unused)),
+    size_t length __attribute__((unused)))
+{
+    __asm__(
+        "mov x16, #2\n"
+        "brk #0xf00d\n"
+        "ret\n");
+}
+
+__attribute__((noinline, optnone, naked))
+static void ais_jit26_set_detach_after_first_breakpoint(int enabled __attribute__((unused)))
+{
+    __asm__(
+        "mov x16, #3\n"
+        "brk #0xf00d\n"
+        "ret\n");
+}
+#endif
+
+__attribute__((visibility("default"), used)) bool DeviceHasTXM(void)
+{
+    return ais_requires_universal_jit() != 0;
+}
+
+static void *ais_run_legacy_jit_handshake(size_t length)
+{
+#if defined(AIS_TESTING)
+    (void)length;
+    return (void *)g_test_legacy_result;
+#elif defined(__APPLE__) && defined(__aarch64__)
+    return ais_jit26_create_region_legacy(length);
+#else
+    (void)length;
+    return NULL;
+#endif
+}
+
+static void ais_install_universal_jit_extension(void)
+{
+#if defined(AIS_TESTING)
+    g_test_script_sent = 1;
+#elif defined(__APPLE__) && defined(__aarch64__)
+    ais_jit26_send_script(g_universal_jit_extension, strlen(g_universal_jit_extension));
+#endif
+}
+
+static void ais_configure_detach_after_first_breakpoint(void)
+{
+#if defined(AIS_TESTING)
+    g_test_detach_configured = 1;
+#elif defined(__APPLE__) && defined(__aarch64__)
+    ais_jit26_set_detach_after_first_breakpoint(1);
+#endif
+}
 
 static void ais_set_error_locked(const char *message)
 {
@@ -220,6 +350,11 @@ ais_result ais_jit_probe(void)
         pthread_mutex_unlock(&g_lock);
         return AIS_ERROR_INVALID_STATE;
     }
+    if (g_jit_status == AIS_JIT_PREPARED) {
+        ais_set_error_locked(NULL);
+        pthread_mutex_unlock(&g_lock);
+        return AIS_OK;
+    }
     pthread_mutex_unlock(&g_lock);
 
     long page_size = sysconf(_SC_PAGESIZE);
@@ -283,6 +418,9 @@ ais_jit_status ais_jit_get_status(void)
 
 int ais_jit_is_debugged(void)
 {
+#if defined(AIS_TESTING)
+    return g_test_is_debugged;
+#else
     ais_csops_fn csops_function = (ais_csops_fn)dlsym(RTLD_DEFAULT, "csops");
     if (csops_function == NULL) {
         return 0;
@@ -294,6 +432,81 @@ int ais_jit_is_debugged(void)
     }
 
     return (flags & AIS_CS_DEBUGGED) != 0u;
+#endif
+}
+
+ais_result ais_jit_prepare(void)
+{
+    pthread_mutex_lock(&g_lock);
+    if (g_jvm_started) {
+        ais_set_error_locked("JIT cannot be prepared after the JVM launch has started.");
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_INVALID_STATE;
+    }
+    if (g_jit_status == AIS_JIT_PREPARED) {
+        ais_set_error_locked(NULL);
+        pthread_mutex_unlock(&g_lock);
+        return AIS_OK;
+    }
+    if (g_jit_status != AIS_JIT_AVAILABLE) {
+        ais_set_error_locked("Call ais_jit_probe successfully before preparing JIT.");
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_INVALID_STATE;
+    }
+    pthread_mutex_unlock(&g_lock);
+
+    if (!ais_requires_universal_jit()) {
+        pthread_mutex_lock(&g_lock);
+        g_jit_status = AIS_JIT_PREPARED;
+        ais_set_error_locked(NULL);
+        pthread_mutex_unlock(&g_lock);
+        return AIS_OK;
+    }
+
+    if (!ais_jit_is_debugged()) {
+        pthread_mutex_lock(&g_lock);
+        g_runtime_state = AIS_RUNTIME_JIT_REQUIRED;
+        ais_set_error_locked(
+            "Universal JIT preparation requires a debugger running universal.js.");
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_JIT_PREPARATION_FAILED;
+    }
+
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        pthread_mutex_lock(&g_lock);
+        g_runtime_state = AIS_RUNTIME_JIT_REQUIRED;
+        ais_set_error_locked("Unable to determine the page size for Universal JIT preparation.");
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_JIT_PREPARATION_FAILED;
+    }
+
+    void *handshake_result = ais_run_legacy_jit_handshake((size_t)page_size);
+    if ((uintptr_t)handshake_result != AIS_UNIVERSAL_LEGACY_SENTINEL) {
+        pthread_mutex_lock(&g_lock);
+        g_runtime_state = AIS_RUNTIME_JIT_REQUIRED;
+        ais_set_error_locked(
+            "Universal JIT handshake failed. Attach with universal.js before starting Java.");
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_JIT_PREPARATION_FAILED;
+    }
+
+    ais_install_universal_jit_extension();
+    ais_configure_detach_after_first_breakpoint();
+
+    if (setenv("XNU_HAS_TXM", "1", 1) != 0) {
+        pthread_mutex_lock(&g_lock);
+        g_runtime_state = AIS_RUNTIME_JIT_REQUIRED;
+        ais_set_errno_error_locked("setenv(XNU_HAS_TXM)");
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_ENVIRONMENT_FAILED;
+    }
+
+    pthread_mutex_lock(&g_lock);
+    g_jit_status = AIS_JIT_PREPARED;
+    ais_set_error_locked(NULL);
+    pthread_mutex_unlock(&g_lock);
+    return AIS_OK;
 }
 
 ais_result ais_runtime_initialize(const char *java_home)
@@ -312,9 +525,10 @@ ais_result ais_runtime_initialize(const char *java_home)
         pthread_mutex_unlock(&g_lock);
         return AIS_ERROR_INVALID_STATE;
     }
-    if (g_jit_status != AIS_JIT_AVAILABLE) {
+    if (g_jit_status != AIS_JIT_PREPARED) {
         g_runtime_state = AIS_RUNTIME_JIT_REQUIRED;
-        ais_set_error_locked("JIT executable mapping is not available. Call ais_jit_probe after enabling JIT.");
+        ais_set_error_locked(
+            "JIT is not prepared. Call ais_jit_probe and ais_jit_prepare before initialization.");
         pthread_mutex_unlock(&g_lock);
         return AIS_ERROR_JIT_UNAVAILABLE;
     }
@@ -507,6 +721,11 @@ void ais_test_reset(void)
     g_java_exited = 0;
     g_java_exit_code = 0;
     g_jli_reentry_launch = NULL;
+    g_test_requires_universal_jit = 0;
+    g_test_is_debugged = 0;
+    g_test_legacy_result = AIS_UNIVERSAL_LEGACY_SENTINEL;
+    g_test_script_sent = 0;
+    g_test_detach_configured = 0;
     ais_set_error_locked(NULL);
     pthread_mutex_unlock(&g_lock);
 }
@@ -514,7 +733,7 @@ void ais_test_reset(void)
 void ais_test_set_runtime_ready(ais_jli_launch_fn launch)
 {
     pthread_mutex_lock(&g_lock);
-    g_jit_status = AIS_JIT_AVAILABLE;
+    g_jit_status = AIS_JIT_PREPARED;
     g_runtime_state = AIS_RUNTIME_READY;
     g_libjli_handle = (void *)(uintptr_t)1u;
     g_jli_launch = launch;
@@ -524,6 +743,26 @@ void ais_test_set_runtime_ready(ais_jli_launch_fn launch)
     g_jli_reentry_launch = NULL;
     ais_set_error_locked(NULL);
     pthread_mutex_unlock(&g_lock);
+}
+
+void ais_test_configure_universal_jit(
+    int required,
+    int debugged,
+    uintptr_t handshake_result)
+{
+    g_test_requires_universal_jit = required;
+    g_test_is_debugged = debugged;
+    g_test_legacy_result = handshake_result;
+}
+
+int ais_test_universal_script_was_sent(void)
+{
+    return g_test_script_sent;
+}
+
+int ais_test_detach_was_configured(void)
+{
+    return g_test_detach_configured;
 }
 #endif
 

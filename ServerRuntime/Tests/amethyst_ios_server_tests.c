@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -24,6 +25,9 @@ typedef int (*ais_test_jli_launch_fn)(
 
 void ais_test_reset(void);
 void ais_test_set_runtime_ready(ais_test_jli_launch_fn launch);
+void ais_test_configure_universal_jit(int required, int debugged, uintptr_t handshake_result);
+int ais_test_universal_script_was_sent(void);
+int ais_test_detach_was_configured(void);
 
 static atomic_int g_fake_launch_release;
 static int g_fake_argc;
@@ -118,6 +122,67 @@ static void test_jit_probe_reaches_a_terminal_status(void)
     }
 }
 
+static void test_jit_prepare_requires_a_successful_probe(void)
+{
+    ais_test_reset();
+    assert(ais_jit_prepare() == AIS_ERROR_INVALID_STATE);
+    assert(ais_jit_get_status() == AIS_JIT_UNKNOWN);
+    assert(strstr(ais_last_error(), "probe") != NULL);
+}
+
+static void test_jit_prepare_advances_the_runtime_contract(void)
+{
+    ais_test_reset();
+    if (ais_jit_probe() != AIS_OK) {
+        return;
+    }
+
+    assert(ais_jit_prepare() == AIS_OK);
+    assert(ais_jit_get_status() == AIS_JIT_PREPARED);
+}
+
+static void test_universal_jit_prepare_requires_a_debugger(void)
+{
+    ais_test_reset();
+    if (ais_jit_probe() != AIS_OK) {
+        return;
+    }
+    ais_test_configure_universal_jit(1, 0, 0x690000E0u);
+
+    assert(ais_jit_prepare() == AIS_ERROR_JIT_PREPARATION_FAILED);
+    assert(ais_jit_get_status() == AIS_JIT_AVAILABLE);
+    assert(strstr(ais_last_error(), "universal.js") != NULL);
+}
+
+static void test_universal_jit_prepare_rejects_the_wrong_script(void)
+{
+    ais_test_reset();
+    if (ais_jit_probe() != AIS_OK) {
+        return;
+    }
+    ais_test_configure_universal_jit(1, 1, 0u);
+
+    assert(ais_jit_prepare() == AIS_ERROR_JIT_PREPARATION_FAILED);
+    assert(ais_jit_get_status() == AIS_JIT_AVAILABLE);
+    assert(ais_test_universal_script_was_sent() == 0);
+    assert(strstr(ais_last_error(), "handshake") != NULL);
+}
+
+static void test_universal_jit_prepare_installs_the_hotspot_extension(void)
+{
+    ais_test_reset();
+    if (ais_jit_probe() != AIS_OK) {
+        return;
+    }
+    ais_test_configure_universal_jit(1, 1, 0x690000E0u);
+
+    assert(ais_jit_prepare() == AIS_OK);
+    assert(ais_jit_get_status() == AIS_JIT_PREPARED);
+    assert(ais_test_universal_script_was_sent() != 0);
+    assert(ais_test_detach_was_configured() != 0);
+    assert(strcmp(getenv("XNU_HAS_TXM"), "1") == 0);
+}
+
 static void test_missing_runtime_is_reported_after_successful_jit_probe(void)
 {
     ais_test_reset();
@@ -125,6 +190,7 @@ static void test_missing_runtime_is_reported_after_successful_jit_probe(void)
     if (ais_jit_get_status() != AIS_JIT_AVAILABLE) {
         return;
     }
+    assert(ais_jit_prepare() == AIS_OK);
 
     ais_result result = ais_runtime_initialize("/definitely/not/a/java/home");
     assert(result == AIS_ERROR_RUNTIME_NOT_FOUND);
@@ -188,6 +254,11 @@ int main(void)
     test_abi_version();
     test_initialize_rejects_empty_java_home();
     test_jit_probe_reaches_a_terminal_status();
+    test_jit_prepare_requires_a_successful_probe();
+    test_jit_prepare_advances_the_runtime_contract();
+    test_universal_jit_prepare_requires_a_debugger();
+    test_universal_jit_prepare_rejects_the_wrong_script();
+    test_universal_jit_prepare_installs_the_hotspot_extension();
     test_missing_runtime_is_reported_after_successful_jit_probe();
     test_java_start_requires_initialized_runtime();
     test_java_start_copies_arguments_and_enforces_one_shot_lifecycle();

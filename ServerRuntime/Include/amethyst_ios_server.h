@@ -13,7 +13,7 @@
 extern "C" {
 #endif
 
-#define AIS_ABI_VERSION 3u
+#define AIS_ABI_VERSION 4u
 
 typedef enum ais_result {
     AIS_OK = 0,
@@ -26,13 +26,15 @@ typedef enum ais_result {
     AIS_ERROR_JVM_ALREADY_USED = -7,
     AIS_ERROR_ALLOCATION_FAILED = -8,
     AIS_ERROR_THREAD_CREATE_FAILED = -9,
-    AIS_ERROR_ENVIRONMENT_FAILED = -10
+    AIS_ERROR_ENVIRONMENT_FAILED = -10,
+    AIS_ERROR_JIT_PREPARATION_FAILED = -11
 } ais_result;
 
 typedef enum ais_jit_status {
     AIS_JIT_UNKNOWN = 0,
     AIS_JIT_UNAVAILABLE = 1,
-    AIS_JIT_AVAILABLE = 2
+    AIS_JIT_AVAILABLE = 2,
+    AIS_JIT_PREPARED = 3
 } ais_jit_status;
 
 typedef enum ais_runtime_state {
@@ -59,6 +61,13 @@ AIS_EXPORT ais_jit_status ais_jit_get_status(void);
 
 /** Returns non-zero when the process has the CS_DEBUGGED code-signing flag. */
 AIS_EXPORT int ais_jit_is_debugged(void);
+
+/**
+ * Prepares the iOS 26+ Universal JIT breakpoint protocol before HotSpot is
+ * loaded. On systems that do not require debugger-assisted executable memory,
+ * this advances directly to AIS_JIT_PREPARED.
+ */
+AIS_EXPORT ais_result ais_jit_prepare(void);
 
 /**
  * Validates java_home, sets JAVA_HOME, loads libjli with RTLD_GLOBAL, and

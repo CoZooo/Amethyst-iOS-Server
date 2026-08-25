@@ -10,7 +10,9 @@
 
 原生库输出到 `build-ios/Debug-iphoneos/libAmethystIOSServer.a`。
 
-当前 C ABI 版本为 v3。Bridge 在专用原生线程调用 `JLI_Launch`，并按“一次 App 进程只启动一次 JVM”约束管理状态；JVM 返回后必须重启宿主 App，不能直接再次创建 JVM。
+当前 C ABI 版本为 v4。宿主必须依次调用 `ais_jit_probe`、`ais_jit_prepare`、`ais_runtime_initialize` 和 `ais_java_start`。Bridge 在专用原生线程调用 `JLI_Launch`，并按“一次 App 进程只启动一次 JVM”约束管理状态；JVM 返回后必须重启宿主 App，不能直接再次创建 JVM。
+
+iOS/iPadOS 26 及以上真机需要在进程启动时使用 `universal.js` 附加 debugger。`ais_jit_prepare` 会在加载 HotSpot 前完成旧版 `brk #0x69` 探测、注入 Universal 扩展并配置首次 CodeCache 映射后分离；没有匹配脚本时会返回 `AIS_ERROR_JIT_PREPARATION_FAILED`，不会继续启动 JVM。宿主链接器必须保留并动态导出 `_DeviceHasTXM`、`_JIT26Detach` 和 `_JIT26PrepareRegion`。
 
 Host 状态机测试：
 
