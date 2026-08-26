@@ -82,9 +82,11 @@ static int g_console_stdin_write = -1;
 static char g_last_error[512] = "";
 
 #if defined(__APPLE__) && TARGET_OS_IOS && !defined(AIS_TESTING)
-static _Thread_local int g_is_jli_reentry_thread = 0;
-static void (*g_original_libjli_exit)(int) = NULL;
+static void (*g_original_java_exit)(int) = NULL;
+static int g_java_exit_hooks_registered = 0;
 #endif
+
+static void ais_record_java_exit(int exit_code);
 
 #if defined(AIS_TESTING)
 static int g_test_requires_universal_jit = 0;
@@ -455,48 +457,74 @@ ais_result ais_console_write(const void *bytes, size_t length)
 
 #if defined(__APPLE__) && TARGET_OS_IOS && !defined(AIS_TESTING)
 __attribute__((noreturn))
-static void ais_libjli_exit(int exit_code)
+static void ais_java_runtime_exit(int exit_code)
 {
-    if (g_is_jli_reentry_thread) {
+    pthread_mutex_lock(&g_lock);
+    int isolate_exit = g_jvm_started;
+    pthread_mutex_unlock(&g_lock);
+
+    if (isolate_exit) {
+        ais_record_java_exit(exit_code);
         pthread_exit((void *)(intptr_t)exit_code);
     }
 
-    g_original_libjli_exit(exit_code);
+    g_original_java_exit(exit_code);
     __builtin_unreachable();
 }
 
-static int ais_install_libjli_exit_hook(ais_jli_launch_fn launch)
+static int ais_is_java_runtime_image(const char *path)
+{
+    if (path == NULL) {
+        return 0;
+    }
+
+    const char *name = strrchr(path, '/');
+    name = name == NULL ? path : name + 1;
+    return strcmp(name, "libjli.dylib") == 0 ||
+           strcmp(name, "libjvm.dylib") == 0;
+}
+
+static void ais_hook_java_runtime_image(
+    const struct mach_header *header,
+    intptr_t slide)
 {
     Dl_info image_info;
-    if (dladdr((void *)(uintptr_t)launch, &image_info) == 0 || image_info.dli_fbase == NULL) {
-        return 0;
+    if (dladdr((const void *)header, &image_info) == 0 ||
+        !ais_is_java_runtime_image(image_info.dli_fname)) {
+        return;
     }
 
-    const struct mach_header *header = image_info.dli_fbase;
-    intptr_t slide = 0;
-    int image_found = 0;
-    uint32_t image_count = _dyld_image_count();
-    for (uint32_t index = 0; index < image_count; ++index) {
-        if (_dyld_get_image_header(index) == header) {
-            slide = _dyld_get_image_vmaddr_slide(index);
-            image_found = 1;
-            break;
-        }
-    }
-    if (!image_found) {
-        return 0;
-    }
-
+    void (*original_exit)(int) = NULL;
     struct rebinding exit_rebinding = {
         .name = "exit",
-        .replacement = (void *)(uintptr_t)ais_libjli_exit,
-        .replaced = (void **)&g_original_libjli_exit
+        .replacement = (void *)(uintptr_t)ais_java_runtime_exit,
+        .replaced = (void **)&original_exit
     };
-    if (rebind_symbols_image((void *)header, slide, &exit_rebinding, 1) != 0) {
-        return 0;
+    if (rebind_symbols_image(
+            (void *)header,
+            slide,
+            &exit_rebinding,
+            1) == 0 &&
+        original_exit != NULL &&
+        g_original_java_exit == NULL) {
+        g_original_java_exit = original_exit;
+    }
+}
+
+static int ais_install_java_exit_hooks(ais_jli_launch_fn launch)
+{
+    if (!g_java_exit_hooks_registered) {
+        /* libjvm is loaded after libjli, so the dyld callback must cover future
+         * images. Restrict rebinding to the two Java runtime images instead of
+         * changing exit() semantics for the .NET/UIKit host. */
+        _dyld_register_func_for_add_image(ais_hook_java_runtime_image);
+        g_java_exit_hooks_registered = 1;
     }
 
-    return g_original_libjli_exit != NULL;
+    Dl_info image_info;
+    return dladdr((void *)(uintptr_t)launch, &image_info) != 0 &&
+           ais_is_java_runtime_image(image_info.dli_fname) &&
+           g_original_java_exit != NULL;
 }
 #endif
 
@@ -629,10 +657,6 @@ int ais_jli_reentry_launch(int argc, char **argv)
     if (launch == NULL) {
         return EXIT_FAILURE;
     }
-
-#if defined(__APPLE__) && TARGET_OS_IOS && !defined(AIS_TESTING)
-    g_is_jli_reentry_thread = 1;
-#endif
 
     int exit_code = launch(
         argc,
@@ -942,10 +966,10 @@ ais_result ais_runtime_initialize(const char *java_home)
     }
 
 #if defined(__APPLE__) && TARGET_OS_IOS && !defined(AIS_TESTING)
-    if (!ais_install_libjli_exit_hook(launch)) {
+    if (!ais_install_java_exit_hooks(launch)) {
         pthread_mutex_lock(&g_lock);
         g_runtime_state = AIS_RUNTIME_FAILED;
-        ais_set_error_locked("Unable to isolate libjli exit() from the host process.");
+        ais_set_error_locked("Unable to isolate Java runtime exit() from the host process.");
         pthread_mutex_unlock(&g_lock);
         return AIS_ERROR_DLOPEN_FAILED;
     }

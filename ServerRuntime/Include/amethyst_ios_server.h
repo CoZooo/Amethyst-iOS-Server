@@ -103,8 +103,8 @@ AIS_EXPORT int ais_runtime_jli_launch_available(void);
  *
  * A process may call this successfully only once. After JLI_Launch returns,
  * the runtime enters AIS_RUNTIME_RESTART_REQUIRED.
- * The runtime isolates the Apple launcher's exit() call so the iOS host can
- * observe the terminal state without terminating the app process.
+ * The runtime isolates libjli/libjvm exit() calls so the iOS host can observe
+ * the terminal state without terminating the app process.
  */
 AIS_EXPORT ais_result ais_java_start(int argc, const char *const *argv);
 
