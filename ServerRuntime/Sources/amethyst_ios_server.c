@@ -27,7 +27,7 @@
 
 #if !defined(AIS_TESTING)
 static const char g_universal_jit_extension[] =
-    "logLevel = LOG_ERROR;\n"
+    "logLevel = LOG_INFO;\n"
     "let detachAfterFirstBr = false;\n"
     "legacyCommands[0x69] = function(brkResponse) {\n"
     "    x1 = x0;\n"

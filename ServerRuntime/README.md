@@ -12,7 +12,7 @@
 
 当前 C ABI 版本为 v6。宿主必须依次调用 `ais_jit_probe`、`ais_jit_prepare`、`ais_runtime_initialize` 和 `ais_java_start`。需要交互式 Console 时，还必须在启动 Java 前调用一次 `ais_console_prepare`。Bridge 在专用原生线程调用 `JLI_Launch`，并按“一次 App 进程只启动一次 JVM”约束管理状态；JVM 返回后必须重启宿主 App，不能直接再次创建 JVM。
 
-iOS/iPadOS 26 及以上真机需要在进程启动时使用 `universal.js` 附加 debugger。`ais_jit_prepare` 会在加载 HotSpot 前完成旧版 `brk #0x69` 探测并注入 Universal 扩展；当前实现会在 HotSpot 建立 CodeCache 期间保持 debugger 连接，避免过早分离导致可执行页失效。宿主确认 JVM 已经可以执行应用代码后，必须调用一次幂等的 `ais_jit_release_debugger_after_jvm_ready`，否则 debugger 会继续拦截 HotSpot 信号。注入扩展会把 Universal JIT 日志降到错误级，避免附加期间逐条打印 HotSpot 用于隐式检查的正常信号。没有匹配脚本时会返回 `AIS_ERROR_JIT_PREPARATION_FAILED`，不会继续启动 JVM。宿主链接器必须保留并动态导出 `_DeviceHasTXM`、`_JIT26Detach` 和 `_JIT26PrepareRegion`。
+iOS/iPadOS 26 及以上真机需要在进程启动时使用 `universal.js` 附加 debugger。`ais_jit_prepare` 会在加载 HotSpot 前完成旧版 `brk #0x69` 探测并注入 Universal 扩展；当前实现会在 HotSpot 建立 CodeCache 期间保持 debugger 连接，避免过早分离导致可执行页失效。宿主确认 JVM 已经可以执行应用代码后，必须调用一次幂等的 `ais_jit_release_debugger_after_jvm_ready`，否则 debugger 会继续拦截 HotSpot 信号。没有匹配脚本时会返回 `AIS_ERROR_JIT_PREPARATION_FAILED`，不会继续启动 JVM。宿主链接器必须保留并动态导出 `_DeviceHasTXM`、`_JIT26Detach` 和 `_JIT26PrepareRegion`。
 
 Host 状态机测试：
 
