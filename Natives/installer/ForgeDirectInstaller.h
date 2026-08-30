@@ -42,4 +42,12 @@ typedef NS_ENUM(NSInteger, ForgeDirectInstallerErrorCode) {
 
 + (BOOL)ensureParentVersionExists:(NSString *)minecraftVersion error:(NSError **)error;
 
+/// MSLX server adapter: keeps Amethyst's installer parsing rules while using
+/// an instance root and server-side paths instead of launcher profiles.
++ (BOOL)prepareForgeServerInstaller:(NSString *)installerPath
+                         instanceRoot:(NSString *)instanceRoot
+                    vanillaServerJar:(NSString *)vanillaServerJar
+                              result:(NSDictionary **)result
+                               error:(NSError **)error;
+
 @end

@@ -29,7 +29,10 @@
 #import "LauncherPreferences.h"
 #import "MinecraftResourceUtils.h"
 #import "ForgeProcessorExecutor.h"
+#import "ForgeServerInstallerAdapter.h"
 #import "external/UnzipKit/UZKArchive.h"
+
+#include <string.h>
 
 NSString *const NeoForgeDirectInstallerErrorDomain = @"NeoForgeDirectInstallerErrorDomain";
 
@@ -196,6 +199,37 @@ NSString *const NeoForgeDirectInstallerErrorDomain = @"NeoForgeDirectInstallerEr
     }
 
     return dict[@"spec"] != nil;
+}
+
++ (BOOL)prepareNeoForgeServerInstaller:(NSString *)installerPath
+                           instanceRoot:(NSString *)instanceRoot
+                      vanillaServerJar:(NSString *)vanillaServerJar
+                                result:(NSDictionary **)result
+                                 error:(NSError **)error {
+    if (result) *result = nil;
+    char buffer[32768] = {0};
+    int code = ais_forge_server_prepare(installerPath.UTF8String,
+                                        instanceRoot.UTF8String,
+                                        vanillaServerJar.UTF8String,
+                                        buffer,
+                                        sizeof(buffer));
+    if (code != 0) {
+        if (error) {
+            const char *detail = ais_forge_server_last_error();
+            *error = [NSError errorWithDomain:NeoForgeDirectInstallerErrorDomain
+                                         code:code
+                                     userInfo:@{NSLocalizedDescriptionKey:
+                                                    detail && detail[0]
+                                                ? [NSString stringWithUTF8String:detail]
+                                                : @"Native NeoForge server preparation failed."}];
+        }
+        return NO;
+    }
+    NSData *data = [NSData dataWithBytes:buffer length:strlen(buffer)];
+    NSDictionary *value = [NSJSONSerialization JSONObjectWithData:data options:0 error:error];
+    if (![value isKindOfClass:[NSDictionary class]]) return NO;
+    if (result) *result = value;
+    return YES;
 }
 
 #pragma mark - New format (NeoForge 1.20.1+)

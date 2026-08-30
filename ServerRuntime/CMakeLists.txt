@@ -15,6 +15,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
         Sources/apple_jli_main.cpp
         Sources/dyld_bypass_runtime_compat.m
         ../Natives/dyld_bypass_validation.m
+        ../Natives/installer/ForgeServerInstallerAdapter.m
         ../Natives/external/fishhook/fishhook.c
     )
     set_source_files_properties(
@@ -25,7 +26,15 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     )
     target_include_directories(AmethystIOSServer PRIVATE
         Sources
+        ../Natives
+        ../Natives/external/UnzipKit
         ../Natives/external/fishhook
+    )
+    target_link_libraries(AmethystIOSServer
+        PUBLIC
+        "-framework Foundation"
+        "-F\${CMAKE_CURRENT_LIST_DIR}/../Natives/resources/Frameworks"
+        "-framework UnzipKit"
     )
     target_compile_options(AmethystIOSServer PRIVATE
         $<$<COMPILE_LANGUAGE:OBJC>:-fobjc-arc>

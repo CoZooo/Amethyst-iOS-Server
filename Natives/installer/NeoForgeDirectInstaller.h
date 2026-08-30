@@ -39,4 +39,11 @@ typedef NS_ENUM(NSInteger, NeoForgeDirectInstallerErrorCode) {
 
 + (BOOL)isNewFormatInstaller:(NSString *)installerPath;
 
+/// MSLX server adapter shared with the NeoForge installer path.
++ (BOOL)prepareNeoForgeServerInstaller:(NSString *)installerPath
+                           instanceRoot:(NSString *)instanceRoot
+                      vanillaServerJar:(NSString *)vanillaServerJar
+                                result:(NSDictionary **)result
+                                 error:(NSError **)error;
+
 @end
