@@ -14,7 +14,11 @@
 #include <sys/syscall.h>
 #include <libkern/OSCacheControl.h>
 
+#if defined(AMETHYST_SERVER_RUNTIME)
+#include "../ServerRuntime/Sources/dyld_bypass_runtime_compat.h"
+#else
 #include "utils.h"
+#endif
 
 #define ASM(...) __asm__(#__VA_ARGS__)
 // ldr x8, value; br x8; value: .ascii "\x41\x42\x43\x44\x45\x46\x47\x48"
@@ -68,7 +72,15 @@ bool redirectFunctionDirect(char *name, void *patchAddr, void *target) {
 }
 // redirectFunction for iOS 26+ (TXM)
 bool redirectFunctionMirrored(char *name, void *patchAddr, void *target) {
-    if (DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED | JIT_FLAG_HAS_TXM)) {
+    /*
+     * TXM requires the debugger to prepare an existing executable page before
+     * its writable mirror is modified. FORCE_MIRRORED describes the allocator
+     * fallback and is not guaranteed to be present once JIT can create RX
+     * mappings. Requiring both flags skipped command 4 on normal iOS 26 TXM
+     * devices (flags 0x5), leaving the shared-cache write blocked after
+     * vm_remap.
+    */
+    if (DeviceHasJITFlags(JIT_FLAG_HAS_TXM)) {
         JIT26PrepareRegionForPatching(patchAddr, sizeof(patch));
     }
     // mirror `addr` (rx, JIT applied) to `mirrored` (rw)
@@ -171,7 +183,9 @@ void* hooked_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off
     if (map == MAP_FAILED) {
         //printf("[DyldLVBypass] mmap(prot=%d, flags=%d, fd=%d)\n", prot, flags, fd);
         map = __mmap(addr, len, prot, flags | MAP_PRIVATE | MAP_ANON, 0, 0);
-        if (DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED | JIT_FLAG_HAS_TXM)) {
+        /* Every anonymous executable fallback on TXM must be prepared by the
+         * attached Universal JIT debugger before control can enter it. */
+        if (DeviceHasJITFlags(JIT_FLAG_HAS_TXM)) {
             JIT26PrepareRegion(map, len);
         }
         

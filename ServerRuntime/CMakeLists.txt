@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.25)
 project(AmethystIOSServerRuntime VERSION 0.1.0 LANGUAGES C)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    enable_language(CXX)
+    enable_language(CXX OBJC)
 endif()
 
 add_library(AmethystIOSServer STATIC
@@ -13,10 +13,22 @@ add_library(AmethystIOSServer STATIC
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     target_sources(AmethystIOSServer PRIVATE
         Sources/apple_jli_main.cpp
+        Sources/dyld_bypass_runtime_compat.m
+        ../Natives/dyld_bypass_validation.m
         ../Natives/external/fishhook/fishhook.c
     )
+    set_source_files_properties(
+        ../Natives/dyld_bypass_validation.m
+        PROPERTIES
+            COMPILE_DEFINITIONS AMETHYST_SERVER_RUNTIME=1
+            COMPILE_OPTIONS -Wno-sign-compare
+    )
     target_include_directories(AmethystIOSServer PRIVATE
+        Sources
         ../Natives/external/fishhook
+    )
+    target_compile_options(AmethystIOSServer PRIVATE
+        $<$<COMPILE_LANGUAGE:OBJC>:-fobjc-arc>
     )
 endif()
 

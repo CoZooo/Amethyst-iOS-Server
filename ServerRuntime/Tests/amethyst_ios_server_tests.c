@@ -31,6 +31,7 @@ void ais_test_configure_universal_jit(int required, int debugged, uintptr_t hand
 int ais_test_universal_script_was_sent(void);
 int ais_test_detach_after_first_breakpoint(void);
 int ais_test_debugger_detach_request_count(void);
+int ais_test_non_breakpoint_exception_ports_were_cleared(void);
 int ais_jli_reentry_launch(int argc, char **argv);
 
 static atomic_int g_fake_launch_release;
@@ -229,6 +230,7 @@ static void test_universal_jit_prepare_installs_the_hotspot_extension(void)
     assert(ais_jit_get_status() == AIS_JIT_PREPARED);
     assert(ais_test_universal_script_was_sent() != 0);
     assert(ais_test_detach_after_first_breakpoint() == 0);
+    assert(ais_test_non_breakpoint_exception_ports_were_cleared() != 0);
     assert(strcmp(getenv("XNU_HAS_TXM"), "1") == 0);
 }
 

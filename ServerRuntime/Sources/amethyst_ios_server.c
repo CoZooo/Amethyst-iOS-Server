@@ -6,6 +6,7 @@
 #include <limits.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +15,7 @@
 
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
+#include <mach/mach.h>
 #endif
 
 #if defined(__APPLE__) && TARGET_OS_IOS && !defined(AIS_TESTING)
@@ -38,6 +40,12 @@ static const char g_universal_jit_extension[] =
     "commands[3] = function(brkResponse) {\n"
     "    detachAfterFirstBr = x0 != 0;\n"
     "    log(`JIT26SetDetachAfterFirstBr(${detachAfterFirstBr}) called`);\n"
+    "};\n"
+    "commands[4] = function(brkResponse) {\n"
+    "    let x0str = x0.toString(16);\n"
+    "    let x1str = x1.toString(16);\n"
+    "    let bytes = send_command(`m${x0str},${x1str}`);\n"
+    "    send_command(`M${x0str},${x1str}:${bytes}`);\n"
     "};\n";
 #endif
 
@@ -84,6 +92,7 @@ static char g_last_error[512] = "";
 #if defined(__APPLE__) && TARGET_OS_IOS && !defined(AIS_TESTING)
 static void (*g_original_java_exit)(int) = NULL;
 static int g_java_exit_hooks_registered = 0;
+extern void init_bypassDyldLibValidation(void);
 #endif
 
 static void ais_record_java_exit(int exit_code);
@@ -95,6 +104,7 @@ static uintptr_t g_test_legacy_result = AIS_UNIVERSAL_LEGACY_SENTINEL;
 static int g_test_script_sent = 0;
 static int g_test_detach_configured = -1;
 static int g_test_debugger_detach_request_count = 0;
+static int g_test_non_breakpoint_exception_ports_cleared = 0;
 #endif
 
 static int ais_requires_universal_jit(void)
@@ -128,6 +138,17 @@ void *JIT26PrepareRegion(
 {
     __asm__(
         "mov x16, #1\n"
+        "brk #0xf00d\n"
+        "ret\n");
+}
+
+__attribute__((visibility("default"), used, noinline, optnone, naked))
+void JIT26PrepareRegionForPatching(
+    void *address __attribute__((unused)),
+    size_t length __attribute__((unused)))
+{
+    __asm__(
+        "mov x16, #4\n"
         "brk #0xf00d\n"
         "ret\n");
 }
@@ -201,6 +222,32 @@ static void ais_keep_debugger_attached_for_hotspot_setup(void)
      * after the allocator has finished initializing.
      */
     ais_jit26_set_detach_after_first_breakpoint(0);
+#endif
+}
+
+static int ais_restrict_universal_debugger_to_breakpoints(void)
+{
+#if defined(AIS_TESTING)
+    g_test_non_breakpoint_exception_ports_cleared = 1;
+    return 1;
+#elif defined(__APPLE__) && TARGET_OS_IOS
+    /*
+     * The Universal JIT script must remain attached so it can service the
+     * region-preparation breakpoints emitted by HotSpot and the dyld bypass.
+     * Leaving every exception routed through debugserver makes unrelated
+     * faults stop every thread in the process and can freeze the UI while the
+     * script attempts to forward them. Match Amethyst's always-attached mode:
+     * keep EXC_BREAKPOINT connected, but restore normal handling for every
+     * other exception class.
+     */
+    return task_set_exception_ports(
+               mach_task_self(),
+               EXC_MASK_ALL & ~EXC_MASK_BREAKPOINT,
+               MACH_PORT_NULL,
+               EXCEPTION_DEFAULT,
+               THREAD_STATE_NONE) == KERN_SUCCESS;
+#else
+    return 1;
 #endif
 }
 
@@ -613,6 +660,12 @@ static void *ais_java_launch_thread(void *argument)
     g_runtime_state = AIS_RUNTIME_RUNNING;
     pthread_mutex_unlock(&g_lock);
 
+#if defined(__APPLE__) && TARGET_OS_IOS && !defined(AIS_TESTING)
+    /* dyld hook installation temporarily ignores SIGBUS while rewriting the
+     * shared-cache stubs. HotSpot must receive its normal fault signals. */
+    signal(SIGBUS, SIG_DFL);
+#endif
+
     int exit_code = context->launch(
         context->argc,
         context->argv,
@@ -845,6 +898,15 @@ ais_result ais_jit_prepare(void)
     ais_install_universal_jit_extension();
     ais_keep_debugger_attached_for_hotspot_setup();
 
+    if (!ais_restrict_universal_debugger_to_breakpoints()) {
+        pthread_mutex_lock(&g_lock);
+        g_runtime_state = AIS_RUNTIME_JIT_REQUIRED;
+        ais_set_error_locked(
+            "Unable to restrict the Universal JIT debugger to breakpoint exceptions.");
+        pthread_mutex_unlock(&g_lock);
+        return AIS_ERROR_JIT_PREPARATION_FAILED;
+    }
+
     if (setenv("XNU_HAS_TXM", "1", 1) != 0) {
         pthread_mutex_lock(&g_lock);
         g_runtime_state = AIS_RUNTIME_JIT_REQUIRED;
@@ -944,6 +1006,13 @@ ais_result ais_runtime_initialize(const char *java_home)
         pthread_mutex_unlock(&g_lock);
         return AIS_ERROR_ENVIRONMENT_FAILED;
     }
+
+#if defined(__APPLE__) && TARGET_OS_IOS && !TARGET_OS_SIMULATOR && !defined(AIS_TESTING)
+    /* Install Amethyst's dyld mmap/fcntl hooks only after Universal JIT has
+     * prepared command 4, and immediately before the first external image is
+     * loaded. This permits a runtime signed by a different identity. */
+    init_bypassDyldLibValidation();
+#endif
 
     void *handle = dlopen(libjli_path, RTLD_NOW | RTLD_GLOBAL);
     if (handle == NULL) {
@@ -1133,6 +1202,7 @@ void ais_test_reset(void)
     g_test_script_sent = 0;
     g_test_detach_configured = -1;
     g_test_debugger_detach_request_count = 0;
+    g_test_non_breakpoint_exception_ports_cleared = 0;
     ais_set_error_locked(NULL);
     pthread_mutex_unlock(&g_lock);
 }
@@ -1187,6 +1257,11 @@ int ais_test_detach_after_first_breakpoint(void)
 int ais_test_debugger_detach_request_count(void)
 {
     return g_test_debugger_detach_request_count;
+}
+
+int ais_test_non_breakpoint_exception_ports_were_cleared(void)
+{
+    return g_test_non_breakpoint_exception_ports_cleared;
 }
 #endif
 
