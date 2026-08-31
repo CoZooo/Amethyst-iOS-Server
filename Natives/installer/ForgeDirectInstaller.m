@@ -18,23 +18,102 @@
 //
 
 #import "ForgeDirectInstaller.h"
+#if !defined(AMETHYST_SERVER_RUNTIME)
 #import "PLProfiles.h"
 #import "PLMirrorCenter.h"
 #import "utils.h"
 #import "LauncherPreferences.h"
 #import "MinecraftResourceUtils.h"
+#endif
 #import "ForgeProcessorExecutor.h"
-#import "ForgeServerInstallerAdapter.h"
 #import "external/UnzipKit/UZKArchive.h"
 
+#if defined(AMETHYST_SERVER_RUNTIME)
+#include "amethyst_ios_server.h"
+#endif
+#include <stddef.h>
+#include <stdio.h>
 #include <string.h>
 
 NSString *const ForgeDirectInstallerErrorDomain = @"ForgeDirectInstallerErrorDomain";
+
+static NSError *AISWriteJSONFile(NSDictionary *object, NSString *path)
+{
+    NSError *error = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:object options:NSJSONWritingPrettyPrinted error:&error];
+    if (!data) return error;
+    if (![data writeToFile:path options:NSDataWritingAtomic error:&error]) return error;
+    return nil;
+}
+
+static BOOL AISPathIsInsideDirectory(NSString *path, NSString *directory)
+{
+    NSString *root = [[directory stringByStandardizingPath] stringByTrimmingCharactersInSet:
+        [NSCharacterSet characterSetWithCharactersInString:@"/"]];
+    root = [@"/" stringByAppendingString:root];
+    NSString *candidate = [path stringByStandardizingPath];
+    NSString *prefix = [root stringByAppendingString:@"/"];
+    return [candidate isEqualToString:root] || [candidate hasPrefix:prefix];
+}
+
+static NSString *AISExpandServerPath(NSString *value,
+                                     NSString *root,
+                                     NSString *libraries,
+                                     NSString *minecraftJar,
+                                     NSString *minecraftVersion,
+                                     NSString *installer)
+{
+    NSMutableString *expanded = [value mutableCopy];
+    NSDictionary *variables = @{
+        @"ROOT": root,
+        @"LIBRARY_DIR": libraries,
+        @"MINECRAFT_JAR": minecraftJar,
+        @"MINECRAFT_VERSION": minecraftVersion,
+        @"INSTALLER": installer,
+        @"SIDE": @"server"
+    };
+    for (NSString *key in variables) {
+        [expanded replaceOccurrencesOfString:[NSString stringWithFormat:@"{%@}", key]
+                                  withString:variables[key]
+                                     options:0
+                                       range:NSMakeRange(0, expanded.length)];
+    }
+    NSString *candidate = [expanded copy];
+    if (![candidate hasPrefix:@"/"]) candidate = [root stringByAppendingPathComponent:candidate];
+    return [candidate stringByStandardizingPath];
+}
+
+static BOOL AISProfileIsNeoForge(NSDictionary *profile, NSDictionary *version)
+{
+    for (id candidate in @[profile[@"profile"] ?: @"",
+                           profile[@"path"] ?: @"",
+                           profile[@"version"] ?: @"",
+                           version[@"id"] ?: @""]) {
+        if ([candidate isKindOfClass:[NSString class]] &&
+            [[(NSString *)candidate lowercaseString] containsString:@"neoforge"]) {
+            return YES;
+        }
+        if ([candidate isKindOfClass:[NSString class]] &&
+            [[(NSString *)candidate lowercaseString] hasPrefix:@"net.neoforged:"]) {
+            return YES;
+        }
+    }
+    for (id collection in @[profile[@"libraries"] ?: @[], version[@"libraries"] ?: @[]]) {
+        if (![collection isKindOfClass:[NSArray class]]) continue;
+        for (id item in (NSArray *)collection) {
+            if (![item isKindOfClass:[NSDictionary class]]) continue;
+            NSString *name = [item[@"name"] isKindOfClass:[NSString class]] ? item[@"name"] : nil;
+            if ([name.lowercaseString hasPrefix:@"net.neoforged:"]) return YES;
+        }
+    }
+    return NO;
+}
 
 @implementation ForgeDirectInstaller
 
 #pragma mark - Public
 
+#if !defined(AMETHYST_SERVER_RUNTIME)
 + (BOOL)installForgeFromInstaller:(NSString *)installerPath
                         versionId:(NSString *)versionId
                             error:(NSError **)error {
@@ -213,40 +292,213 @@ NSString *const ForgeDirectInstallerErrorDomain = @"ForgeDirectInstallerErrorDom
 
     return dict[@"spec"] != nil;
 }
+#endif
 
-+ (BOOL)prepareForgeServerInstaller:(NSString *)installerPath
-                         instanceRoot:(NSString *)instanceRoot
-                    vanillaServerJar:(NSString *)vanillaServerJar
-                              result:(NSDictionary **)result
-                               error:(NSError **)error {
++ (BOOL)installForgeServerFromInstaller:(NSString *)installerPath
+                            instanceRoot:(NSString *)instanceRoot
+                       vanillaServerJar:(NSString *)vanillaServerJar
+                              javaHome:(NSString *)javaHome
+                               progress:(void (^)(double, NSString *))progress
+                                 result:(NSDictionary **)result
+                                  error:(NSError **)error {
     if (result) *result = nil;
-    char buffer[32768] = {0};
-    int code = ais_forge_server_prepare(installerPath.UTF8String,
-                                        instanceRoot.UTF8String,
-                                        vanillaServerJar.UTF8String,
-                                        buffer,
-                                        sizeof(buffer));
-    if (code != 0) {
-        if (error) {
-            const char *detail = ais_forge_server_last_error();
-            *error = [NSError errorWithDomain:ForgeDirectInstallerErrorDomain
-                                         code:code
-                                     userInfo:@{NSLocalizedDescriptionKey:
-                                                    detail && detail[0]
-                                                ? [NSString stringWithUTF8String:detail]
-                                                : @"Native Forge server preparation failed."}];
-        }
+    if (error) *error = nil;
+
+    void (^report)(double, NSString *) = ^(double value, NSString *message) {
+        NSLog(@"[ForgeDirect][server] %.2f %@", value, message);
+        if (progress) progress(value, message);
+    };
+    NSString *root = [instanceRoot stringByStandardizingPath];
+    NSString *vanilla = [vanillaServerJar stringByStandardizingPath];
+    if (installerPath.length == 0 || root.length == 0 || vanilla.length == 0 ||
+        ![[NSFileManager defaultManager] fileExistsAtPath:installerPath] ||
+        ![[NSFileManager defaultManager] fileExistsAtPath:vanilla]) {
+        if (error) *error = [NSError errorWithDomain:ForgeDirectInstallerErrorDomain
+                                                  code:ForgeDirectInstallerErrorInvalidArchive
+                                              userInfo:@{NSLocalizedDescriptionKey: @"服务端安装器参数或原版服务端 JAR 不存在。"}];
         return NO;
     }
-    NSData *data = [NSData dataWithBytes:buffer length:strlen(buffer)];
-    NSDictionary *value = [NSJSONSerialization JSONObjectWithData:data options:0 error:error];
-    if (![value isKindOfClass:[NSDictionary class]]) return NO;
-    if (result) *result = value;
-    return YES;
+
+    @try {
+        report(0.02, @"正在读取 Forge 安装器");
+        NSData *profileData = [self dataFromZip:installerPath entry:@"install_profile.json" error:error];
+        NSDictionary *profile = profileData
+            ? [NSJSONSerialization JSONObjectWithData:profileData options:NSJSONReadingMutableContainers error:error]
+            : nil;
+        if (![profile isKindOfClass:[NSDictionary class]]) {
+            if (error && !*error) *error = [NSError errorWithDomain:ForgeDirectInstallerErrorDomain
+                                                                  code:ForgeDirectInstallerErrorInvalidProfile
+                                                              userInfo:@{NSLocalizedDescriptionKey: @"无法解析 install_profile.json。"}];
+            return NO;
+        }
+
+        BOOL oldFormat = profile[@"install"] != nil && profile[@"versionInfo"] != nil;
+        NSString *versionEntry = [profile[@"json"] isKindOfClass:[NSString class]] ? profile[@"json"] : @"version.json";
+        NSData *versionData = oldFormat ? nil : [self dataFromZip:installerPath
+                                                              entry:[versionEntry stringByTrimmingCharactersInSet:
+                                                                          [NSCharacterSet characterSetWithCharactersInString:@"/"]]
+                                                              error:error];
+        NSDictionary *version = oldFormat
+            ? ([profile[@"versionInfo"] isKindOfClass:[NSDictionary class]] ? profile[@"versionInfo"] : nil)
+            : (versionData ? [NSJSONSerialization JSONObjectWithData:versionData options:NSJSONReadingMutableContainers error:error] : nil);
+        if (![version isKindOfClass:[NSDictionary class]]) {
+            if (error && !*error) *error = [NSError errorWithDomain:ForgeDirectInstallerErrorDomain
+                                                                  code:ForgeDirectInstallerErrorInvalidProfile
+                                                              userInfo:@{NSLocalizedDescriptionKey: @"无法解析 Forge 版本信息。"}];
+            return NO;
+        }
+
+        NSString *minecraft = [version[@"inheritsFrom"] isKindOfClass:[NSString class]]
+            ? version[@"inheritsFrom"]
+            : ([profile[@"minecraft"] isKindOfClass:[NSString class]] ? profile[@"minecraft"] : nil);
+        if (minecraft.length == 0 && oldFormat) {
+            minecraft = profile[@"install"][@"minecraft"];
+        }
+        NSString *loader = [profile[@"version"] isKindOfClass:[NSString class]]
+            ? profile[@"version"]
+            : ([version[@"id"] isKindOfClass:[NSString class]] ? version[@"id"] : nil);
+        if (loader.length == 0 && oldFormat) loader = profile[@"install"][@"version"];
+        if (minecraft.length == 0 || loader.length == 0) {
+            if (error) *error = [NSError errorWithDomain:ForgeDirectInstallerErrorDomain
+                                                      code:ForgeDirectInstallerErrorInvalidProfile
+                                                  userInfo:@{NSLocalizedDescriptionKey: @"Forge 安装器缺少 Minecraft 或 Loader 版本。"}];
+            return NO;
+        }
+
+        NSString *libraries = [root stringByAppendingPathComponent:@"libraries"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:libraries
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil
+                                                        error:error];
+        if (oldFormat) {
+            report(0.20, @"正在解压 Forge 服务端核心");
+            NSDictionary *install = profile[@"install"];
+            NSString *entry = [install[@"filePath"] isKindOfClass:[NSString class]] ? install[@"filePath"] : nil;
+            if (entry.length == 0) {
+                if (error) *error = [NSError errorWithDomain:ForgeDirectInstallerErrorDomain
+                                                          code:ForgeDirectInstallerErrorInvalidProfile
+                                                      userInfo:@{NSLocalizedDescriptionKey: @"旧版 Forge 安装器缺少 universal JAR。"}];
+                return NO;
+            }
+            NSString *destination = [install[@"path"] isKindOfClass:[NSString class]]
+                ? [libraries stringByAppendingPathComponent:[self mavenPathToRelativePath:install[@"path"]]]
+                : [root stringByAppendingPathComponent:entry.lastPathComponent];
+            if (![self extractFile:installerPath entry:entry to:destination error:error]) return NO;
+            NSDictionary *serverResult = @{
+                @"kind": @"Forge",
+                @"minecraftVersion": minecraft,
+                @"loaderVersion": loader,
+                @"executableJar": destination
+            };
+            if (result) *result = serverResult;
+            report(1.0, @"Forge 服务端安装完成");
+            return YES;
+        }
+
+        report(0.12, @"正在准备 Forge 运行库");
+        [self extractAllMavenEntries:installerPath toLibrariesDir:libraries];
+        NSArray *runtimeLibraries = [version[@"libraries"] isKindOfClass:[NSArray class]] ? version[@"libraries"] : @[];
+#if defined(AMETHYST_SERVER_RUNTIME)
+        if (![self downloadMissingLibraries:runtimeLibraries
+                               librariesDir:libraries
+                                   progress:^(double p, NSString *message) {
+            report(0.12 + p * 0.20, message);
+        } baseProgress:0.0 progressSpan:1.0 error:error]) return NO;
+#else
+        [self downloadMissingLibraries:runtimeLibraries librariesDir:libraries progress:^(double p, NSString *message) {
+            report(0.12 + p * 0.20, message);
+        } baseProgress:0.0 progressSpan:1.0];
+#endif
+        NSArray *processorLibraries = [profile[@"libraries"] isKindOfClass:[NSArray class]] ? profile[@"libraries"] : @[];
+#if defined(AMETHYST_SERVER_RUNTIME)
+        if (![self downloadMissingLibraries:processorLibraries
+                               librariesDir:libraries
+                                   progress:^(double p, NSString *message) {
+            report(0.32 + p * 0.13, message);
+        } baseProgress:0.0 progressSpan:1.0 error:error]) return NO;
+#else
+        [self downloadMissingLibraries:processorLibraries librariesDir:libraries progress:^(double p, NSString *message) {
+            report(0.32 + p * 0.13, message);
+        } baseProgress:0.0 progressSpan:1.0];
+#endif
+
+        NSMutableDictionary *serverVersion = [version mutableCopy];
+        serverVersion[@"id"] = loader;
+        NSString *versionDir = [root stringByAppendingPathComponent:[NSString stringWithFormat:@"versions/%@", loader]];
+        [[NSFileManager defaultManager] createDirectoryAtPath:versionDir
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil
+                                                        error:error];
+        NSString *versionPath = [versionDir stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.json", loader]];
+        NSError *writeError = AISWriteJSONFile(serverVersion, versionPath);
+        if (writeError) {
+            if (error) *error = writeError;
+            return NO;
+        }
+
+        NSString *serverJarPath = [profile[@"serverJarPath"] isKindOfClass:[NSString class]] ? profile[@"serverJarPath"] : nil;
+        if (serverJarPath.length == 0) serverJarPath = @"server.jar";
+        serverJarPath = AISExpandServerPath(serverJarPath, root, libraries, vanilla, minecraft, installerPath);
+        if (!serverJarPath || !AISPathIsInsideDirectory(serverJarPath, root)) {
+            if (error) *error = [NSError errorWithDomain:ForgeDirectInstallerErrorDomain
+                                                      code:ForgeDirectInstallerErrorWriteFailed
+                                                  userInfo:@{NSLocalizedDescriptionKey: @"Forge serverJarPath 超出实例目录。"}];
+            return NO;
+        }
+        [[NSFileManager defaultManager] createDirectoryAtPath:[serverJarPath stringByDeletingLastPathComponent]
+                                  withIntermediateDirectories:YES
+                                                   attributes:nil
+                                                        error:error];
+        [[NSFileManager defaultManager] removeItemAtPath:serverJarPath error:nil];
+        if (![[NSFileManager defaultManager] copyItemAtPath:vanilla toPath:serverJarPath error:error]) return NO;
+
+        report(0.48, @"正在执行 Forge 服务端处理器");
+        if (![ForgeProcessorExecutor runProcessorsWithProfile:profile
+                                                 installerPath:installerPath
+                                              minecraftVersion:minecraft
+                                                     mainGameDir:root
+                                                 vanillaJarPath:serverJarPath
+                                                            side:@"server"
+                                                         javaHome:javaHome
+                                                     baseProgress:0.48
+                                                    progressSpan:0.42
+                                                        progress:^(double p, NSString *message) {
+            report(p, message);
+        } error:error]) return NO;
+
+        BOOL isNeoForge = AISProfileIsNeoForge(profile, version);
+        NSMutableDictionary *serverResult = [@{
+            @"kind": isNeoForge ? @"NeoForge" : @"Forge",
+            @"minecraftVersion": minecraft,
+            @"loaderVersion": loader,
+            @"serverJarPath": serverJarPath
+        } mutableCopy];
+        NSString *argumentsFile = [self serverArgumentsFileForProfile:profile
+                                                               version:version
+                                                          librariesDir:libraries];
+        if (argumentsFile.length == 0) {
+            if (error) *error = [NSError errorWithDomain:ForgeDirectInstallerErrorDomain
+                                                      code:ForgeDirectInstallerErrorWriteFailed
+                                                  userInfo:@{NSLocalizedDescriptionKey:
+                                                                 @"安装器未生成当前 Forge/NeoForge 版本的 unix_args.txt。"}];
+            return NO;
+        }
+        serverResult[@"argumentsFile"] = argumentsFile;
+        if (result) *result = serverResult;
+        report(1.0, @"Forge 服务端安装完成");
+        return YES;
+    }
+    @catch (NSException *exception) {
+        if (error) *error = [NSError errorWithDomain:ForgeDirectInstallerErrorDomain
+                                                  code:ForgeDirectInstallerErrorException
+                                              userInfo:@{NSLocalizedDescriptionKey: exception.reason ?: @"Forge 服务端安装异常。"}];
+        return NO;
+    }
 }
 
 #pragma mark - Helpers
 
+#if !defined(AMETHYST_SERVER_RUNTIME)
 // 游戏目录：与 JavaLauncher.m 中 [launchTarget isKindOfClass:NSDictionary.class] 分支保持一致
 // 即 $POJAV_HOME/instances/<general.game_directory>/<profile.gameDir>
 // 但直装时还没有 profile，无法读 gameDir，使用默认 "."
@@ -783,11 +1035,21 @@ NSString *const ForgeDirectInstallerErrorDomain = @"ForgeDirectInstallerErrorDom
         }
     }
 
-    NSLog(@"[ForgeDirect] installNewFormat completed");
+NSLog(@"[ForgeDirect] installNewFormat completed");
     return YES;
 }
+#endif
 
 #pragma mark - Maven entry Extraction
+
+#if defined(AMETHYST_SERVER_RUNTIME)
++ (BOOL)ensureParentVersionExists:(NSString *)parentVersionId error:(NSError **)error {
+    if (error) *error = nil;
+    if (parentVersionId.length == 0) return YES;
+    NSLog(@"[ForgeDirect][server] Parent version completion is handled by the server deployment context: %@", parentVersionId);
+    return YES;
+}
+#endif
 
 // 解压 installer.jar 内 maven/ 目录下所有文件到 libraries 目录
 // 返回成功解压的文件数
@@ -848,6 +1110,7 @@ NSString *const ForgeDirectInstallerErrorDomain = @"ForgeDirectInstallerErrorDom
     return count;
 }
 
+#if !defined(AMETHYST_SERVER_RUNTIME)
 #pragma mark - Library Download
 
 // 下载 version.json.libraries 中尚未存在的库
@@ -1112,6 +1375,111 @@ NSString *const ForgeDirectInstallerErrorDomain = @"ForgeDirectInstallerErrorDom
     return [NSString stringWithFormat:@"https://bmclapi2.bangbang93.com/maven/%@", relativePath];
 }
 
+#else
+#pragma mark - ServerRuntime Library Download
+
++ (BOOL)downloadMissingLibraries:(NSArray *)libraries
+                   librariesDir:(NSString *)librariesDir
+                       progress:(void (^)(double, NSString *))progress
+                   baseProgress:(double)base
+                  progressSpan:(double)span
+                          error:(NSError **)error {
+    if (error) *error = nil;
+    NSUInteger total = libraries.count;
+    if (total == 0) return YES;
+
+    NSUInteger processed = 0;
+    for (id item in libraries) {
+        if (![item isKindOfClass:[NSDictionary class]]) {
+            processed++;
+            continue;
+        }
+        NSDictionary *library = (NSDictionary *)item;
+        NSString *name = [library[@"name"] isKindOfClass:[NSString class]] ? library[@"name"] : nil;
+        NSArray *rules = [library[@"rules"] isKindOfClass:[NSArray class]] ? library[@"rules"] : nil;
+        if (rules.count > 0) {
+            BOOL allowed = NO;
+            for (id ruleItem in rules) {
+                if (![ruleItem isKindOfClass:[NSDictionary class]]) continue;
+                NSDictionary *rule = (NSDictionary *)ruleItem;
+                NSDictionary *os = [rule[@"os"] isKindOfClass:[NSDictionary class]] ? rule[@"os"] : nil;
+                NSDictionary *features = [rule[@"features"] isKindOfClass:[NSDictionary class]] ? rule[@"features"] : nil;
+                NSString *osName = [os[@"name"] isKindOfClass:[NSString class]] ? os[@"name"] : nil;
+                NSString *arch = [os[@"arch"] isKindOfClass:[NSString class]] ? os[@"arch"] : nil;
+                BOOL matches = features.count == 0 &&
+                    (osName.length == 0 || [osName isEqualToString:@"osx"]) &&
+                    (arch.length == 0 || [arch isEqualToString:@"arm64"] || [arch isEqualToString:@"aarch64"]);
+                if (matches) allowed = [rule[@"action"] isEqualToString:@"allow"];
+            }
+            if (!allowed) {
+                processed++;
+                continue;
+            }
+        }
+        NSDictionary *downloads = [library[@"downloads"] isKindOfClass:[NSDictionary class]] ? library[@"downloads"] : nil;
+        NSDictionary *artifact = [downloads[@"artifact"] isKindOfClass:[NSDictionary class]] ? downloads[@"artifact"] : nil;
+        NSString *relativePath = [artifact[@"path"] isKindOfClass:[NSString class]] ? artifact[@"path"] : nil;
+        if (relativePath.length == 0 && name.length > 0) relativePath = [self mavenPathToRelativePath:name];
+        if (relativePath.length == 0) {
+            if (error) *error = [NSError errorWithDomain:ForgeDirectInstallerErrorDomain
+                                                      code:ForgeDirectInstallerErrorInvalidProfile
+                                                  userInfo:@{NSLocalizedDescriptionKey:
+                                                                 [NSString stringWithFormat:@"运行库缺少有效 Maven 坐标：%@", name ?: @"<unknown>"]}];
+            return NO;
+        }
+
+        NSString *destination = [librariesDir stringByAppendingPathComponent:relativePath];
+        if (![[NSFileManager defaultManager] fileExistsAtPath:destination]) {
+            NSString *url = [artifact[@"url"] isKindOfClass:[NSString class]] ? artifact[@"url"] : nil;
+            if (url.length == 0) {
+                NSString *declaredBase = [library[@"url"] isKindOfClass:[NSString class]] ? library[@"url"] : nil;
+                if (declaredBase.length > 0) {
+                    url = [[declaredBase stringByAppendingString:[declaredBase hasSuffix:@"/"] ? @"" : @"/"]
+                        stringByAppendingString:relativePath];
+                }
+            }
+            if (url.length == 0 && name.length > 0) {
+                NSString *lower = name.lowercaseString;
+                NSString *baseURL = @"https://libraries.minecraft.net/";
+                if ([lower hasPrefix:@"net.neoforged:"] || [lower hasPrefix:@"net.neoforged."]) {
+                    baseURL = @"https://maven.neoforged.net/releases/";
+                } else if ([lower hasPrefix:@"net.minecraftforge:"] || [lower hasPrefix:@"cpw.mods:"] ||
+                           [lower hasPrefix:@"org.ow2.asm:"] || [lower hasPrefix:@"de.oceanlabs.mcp:"]) {
+                    baseURL = @"https://maven.minecraftforge.net/";
+                }
+                url = [baseURL stringByAppendingString:relativePath];
+            }
+            if (url.length == 0) {
+                if (error) *error = [NSError errorWithDomain:ForgeDirectInstallerErrorDomain
+                                                          code:ForgeDirectInstallerErrorInvalidProfile
+                                                      userInfo:@{NSLocalizedDescriptionKey:
+                                                                     [NSString stringWithFormat:@"运行库缺少下载地址：%@", name ?: relativePath]}];
+                return NO;
+            }
+            NSError *downloadError = nil;
+            if (![self downloadFileFromURL:url toPath:destination error:&downloadError]) {
+                if (error) *error = [NSError errorWithDomain:ForgeDirectInstallerErrorDomain
+                                                          code:ForgeDirectInstallerErrorWriteFailed
+                                                      userInfo:@{NSLocalizedDescriptionKey:
+                                                                     [NSString stringWithFormat:@"运行库下载失败 %@：%@",
+                                                                      name ?: relativePath,
+                                                                      downloadError.localizedDescription ?: @"unknown"]}];
+                return NO;
+            }
+        }
+
+        processed++;
+        if (progress) {
+            double fraction = (double)processed / (double)total;
+            progress(base + span * fraction,
+                     [NSString stringWithFormat:@"正在准备运行库（%lu/%lu）",
+                      (unsigned long)processed, (unsigned long)total]);
+        }
+    }
+    return YES;
+}
+#endif
+
 // 安全创建目录：若路径上存在同名普通文件（之前安装失败残留），先删除再创建。
 // APFS 不允许同名文件和目录共存，直接 createDirectoryAtPath 会失败。
 + (BOOL)ensureDirectoryExists:(NSString *)path error:(NSError **)error {
@@ -1125,7 +1493,13 @@ NSString *const ForgeDirectInstallerErrorDomain = @"ForgeDirectInstallerErrorDom
             if (error) {
                 *error = [NSError errorWithDomain:ForgeDirectInstallerErrorDomain
                                              code:ForgeDirectInstallerErrorWriteFailed
-                                         userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:localize(@"i18n_str_1128", nil), path, removeError.localizedDescription]}];
+                                         userInfo:@{NSLocalizedDescriptionKey:
+#if defined(AMETHYST_SERVER_RUNTIME)
+                                                        [NSString stringWithFormat:@"Failed to replace file with directory %@: %@", path, removeError.localizedDescription]
+#else
+                                                        [NSString stringWithFormat:localize(@"i18n_str_1128", nil), path, removeError.localizedDescription]
+#endif
+                                                    }];
             }
             return NO;
         }
@@ -1165,52 +1539,15 @@ NSString *const ForgeDirectInstallerErrorDomain = @"ForgeDirectInstallerErrorDom
         return NO;
     }
 
-    // 用 NSURLSession 同步下载，带 60 秒超时（避免弱网下 dataWithContentsOfURL 挂死）
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
-    request.timeoutInterval = 60.0;
-    request.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
-    // 添加 User-Agent：部分 maven 仓库（BMCLAPI/Cloudflare 保护的源）会拒绝非浏览器 UA（403/WAF）。
-    // 参照 FCL 使用浏览器风格 UA 提升兼容性。
-    [request setValue:@"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15" forHTTPHeaderField:@"User-Agent"];
-    [request setValue:@"application/java-archive,*/*;q=0.9" forHTTPHeaderField:@"Accept"];
-
-    __block NSData *resultData = nil;
-    __block NSError *resultError = nil;
-    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
-
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:request
-                                                                     completionHandler:^(NSData *data, NSURLResponse *response, NSError *taskError) {
-        if (taskError) {
-            resultError = taskError;
-        } else if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
-            NSInteger statusCode = [(NSHTTPURLResponse *)response statusCode];
-            if (statusCode >= 400) {
-                resultError = [NSError errorWithDomain:ForgeDirectInstallerErrorDomain
-                                                   code:statusCode
-                                               userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"HTTP %ld: %@", (long)statusCode, urlString]}];
-            } else {
-                resultData = data;
-            }
-        } else {
-            resultData = data;
-        }
-        dispatch_semaphore_signal(semaphore);
-    }];
-    [task resume];
-    long waitResult = dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 70 * NSEC_PER_SEC));
-    if (waitResult != 0) {
-        // 信号量超时：取消 task 释放网络资源，避免后台 task 持续运行导致临时内存泄漏
-        [task cancel];
-        if (error) {
-            *error = [NSError errorWithDomain:ForgeDirectInstallerErrorDomain
-                                         code:NSURLErrorTimedOut
-                                     userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:localize(@"i18n_str_1129", nil), urlString]}];
-        }
-        return NO;
-    }
-
-    if (resultError) {
-        if (error) *error = resultError;
+    // 使用 Amethyst 原有的同步 Foundation 下载路径。此方法由后台安装
+    // 线程调用；不通过 NSURLSession completion block 跨线程回写 __block
+    // NSData，避免 iOS 上下载失败分支出现失效对象指针。
+    NSError *requestError = nil;
+    NSData *resultData = [NSData dataWithContentsOfURL:url
+                                               options:NSDataReadingMappedIfSafe
+                                                 error:&requestError];
+    if (requestError) {
+        if (error) *error = requestError;
         return NO;
     }
     if (!resultData || resultData.length == 0) {
@@ -1342,8 +1679,43 @@ NSString *const ForgeDirectInstallerErrorDomain = @"ForgeDirectInstallerErrorDom
 
 #pragma mark - Maven path utilities
 
++ (NSString *)serverArgumentsFileForProfile:(NSDictionary *)profile
+                                     version:(NSDictionary *)version
+                                librariesDir:(NSString *)librariesDir {
+    NSMutableOrderedSet<NSString *> *coordinates = [NSMutableOrderedSet orderedSet];
+    NSString *profilePath = [profile[@"path"] isKindOfClass:[NSString class]] ? profile[@"path"] : nil;
+    if (profilePath.length > 0) [coordinates addObject:profilePath];
+
+    for (id collection in @[version[@"libraries"] ?: @[], profile[@"libraries"] ?: @[]]) {
+        if (![collection isKindOfClass:[NSArray class]]) continue;
+        for (id item in (NSArray *)collection) {
+            if (![item isKindOfClass:[NSDictionary class]]) continue;
+            NSString *name = [item[@"name"] isKindOfClass:[NSString class]] ? item[@"name"] : nil;
+            if (name.length > 0) [coordinates addObject:name];
+        }
+    }
+
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    for (NSString *coordinate in coordinates) {
+        NSString *lower = coordinate.lowercaseString;
+        BOOL isForge = [lower hasPrefix:@"net.minecraftforge:forge:"];
+        BOOL isNeoForge = [lower hasPrefix:@"net.neoforged:neoforge:"] ||
+            [lower hasPrefix:@"net.neoforged:forge:"];
+        if (!isForge && !isNeoForge) continue;
+
+        NSString *artifactPath = [self mavenPathToRelativePath:coordinate];
+        NSString *candidate = [librariesDir stringByAppendingPathComponent:
+            [[artifactPath stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"unix_args.txt"]];
+        BOOL isDirectory = NO;
+        if ([fileManager fileExistsAtPath:candidate isDirectory:&isDirectory] && !isDirectory) {
+            return [candidate stringByStandardizingPath];
+        }
+    }
+    return nil;
+}
+
 + (NSString *)mavenPathToRelativePath:(NSString *)mavenPath {
-    // Format: groupId:artifactId:version[:classifier]
+    // Format: groupId:artifactId:version[:classifier][@extension]
     NSArray *parts = [mavenPath componentsSeparatedByString:@":"];
     if (parts.count < 3) {
         return mavenPath;
@@ -1353,13 +1725,27 @@ NSString *const ForgeDirectInstallerErrorDomain = @"ForgeDirectInstallerErrorDom
     NSString *artifactId = parts[1];
     NSString *version = parts[2];
     NSString *classifier = (parts.count > 3) ? parts[3] : nil;
+    NSString *extension = @"jar";
+    NSRange classifierExtension = classifier.length > 0
+        ? [classifier rangeOfString:@"@"]
+        : NSMakeRange(NSNotFound, 0);
+    if (classifierExtension.location != NSNotFound) {
+        extension = [classifier substringFromIndex:NSMaxRange(classifierExtension)];
+        classifier = [classifier substringToIndex:classifierExtension.location];
+    } else {
+        NSRange versionExtension = [version rangeOfString:@"@"];
+        if (versionExtension.location != NSNotFound) {
+            extension = [version substringFromIndex:NSMaxRange(versionExtension)];
+            version = [version substringToIndex:versionExtension.location];
+        }
+    }
 
     NSString *groupPath = [groupId stringByReplacingOccurrencesOfString:@"." withString:@"/"];
     NSString *jarName;
     if (classifier.length > 0) {
-        jarName = [NSString stringWithFormat:@"%@-%@-%@.jar", artifactId, version, classifier];
+        jarName = [NSString stringWithFormat:@"%@-%@-%@.%@", artifactId, version, classifier, extension];
     } else {
-        jarName = [NSString stringWithFormat:@"%@-%@.jar", artifactId, version];
+        jarName = [NSString stringWithFormat:@"%@-%@.%@", artifactId, version, extension];
     }
 
     return [NSString stringWithFormat:@"%@/%@/%@/%@", groupPath, artifactId, version, jarName];
@@ -1371,3 +1757,57 @@ NSString *const ForgeDirectInstallerErrorDomain = @"ForgeDirectInstallerErrorDom
 }
 
 @end
+
+static char g_ais_forge_server_error[1024];
+
+static void AISSetForgeServerError(NSString *message)
+{
+    const char *value = message.UTF8String ?: "Forge server installation failed.";
+    snprintf(g_ais_forge_server_error, sizeof(g_ais_forge_server_error), "%s", value);
+}
+
+int ais_forge_server_install(const char *installerPath,
+                             const char *instanceRoot,
+                             const char *vanillaServerJar,
+                             const char *javaHome,
+                             char *resultBuffer,
+                             size_t resultCapacity)
+{
+    g_ais_forge_server_error[0] = '\0';
+    if (!installerPath || !instanceRoot || !vanillaServerJar || !resultBuffer || resultCapacity < 2) {
+        AISSetForgeServerError(@"Invalid Forge server installer arguments.");
+        return -1;
+    }
+
+    NSString *installer = [NSString stringWithUTF8String:installerPath];
+    NSString *root = [NSString stringWithUTF8String:instanceRoot];
+    NSString *vanilla = [NSString stringWithUTF8String:vanillaServerJar];
+    NSString *java = [NSString stringWithUTF8String:javaHome ?: ""];
+    NSError *error = nil;
+    NSDictionary *result = nil;
+    BOOL ok = [ForgeDirectInstaller installForgeServerFromInstaller:installer
+                                                         instanceRoot:root
+                                                    vanillaServerJar:vanilla
+                                                          javaHome:java
+                                                            progress:nil
+                                                              result:&result
+                                                               error:&error];
+    if (!ok || !result) {
+        AISSetForgeServerError(error.localizedDescription);
+        return error.code != 0 ? (int)error.code : -2;
+    }
+
+    NSData *json = [NSJSONSerialization dataWithJSONObject:result options:0 error:&error];
+    if (!json || json.length + 1 > resultCapacity) {
+        AISSetForgeServerError(error.localizedDescription ?: @"Forge server installer result is too large.");
+        return -3;
+    }
+    memcpy(resultBuffer, json.bytes, json.length);
+    resultBuffer[json.length] = '\0';
+    return 0;
+}
+
+const char *ais_forge_server_last_error(void)
+{
+    return g_ais_forge_server_error;
+}

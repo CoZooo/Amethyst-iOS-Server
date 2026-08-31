@@ -24,12 +24,14 @@
 //
 
 #import "NeoForgeDirectInstaller.h"
+#if !defined(AMETHYST_SERVER_RUNTIME)
 #import "PLProfiles.h"
 #import "utils.h"
 #import "LauncherPreferences.h"
 #import "MinecraftResourceUtils.h"
+#endif
 #import "ForgeProcessorExecutor.h"
-#import "ForgeServerInstallerAdapter.h"
+#import "ForgeDirectInstaller.h"
 #import "external/UnzipKit/UZKArchive.h"
 
 #include <string.h>
@@ -40,6 +42,7 @@ NSString *const NeoForgeDirectInstallerErrorDomain = @"NeoForgeDirectInstallerEr
 
 #pragma mark - Public
 
+#if !defined(AMETHYST_SERVER_RUNTIME)
 + (BOOL)installNeoForgeFromInstaller:(NSString *)installerPath
                            versionId:(NSString *)versionId
                                error:(NSError **)error {
@@ -200,38 +203,25 @@ NSString *const NeoForgeDirectInstallerErrorDomain = @"NeoForgeDirectInstallerEr
 
     return dict[@"spec"] != nil;
 }
+#endif
 
-+ (BOOL)prepareNeoForgeServerInstaller:(NSString *)installerPath
-                           instanceRoot:(NSString *)instanceRoot
-                      vanillaServerJar:(NSString *)vanillaServerJar
-                                result:(NSDictionary **)result
-                                 error:(NSError **)error {
-    if (result) *result = nil;
-    char buffer[32768] = {0};
-    int code = ais_forge_server_prepare(installerPath.UTF8String,
-                                        instanceRoot.UTF8String,
-                                        vanillaServerJar.UTF8String,
-                                        buffer,
-                                        sizeof(buffer));
-    if (code != 0) {
-        if (error) {
-            const char *detail = ais_forge_server_last_error();
-            *error = [NSError errorWithDomain:NeoForgeDirectInstallerErrorDomain
-                                         code:code
-                                     userInfo:@{NSLocalizedDescriptionKey:
-                                                    detail && detail[0]
-                                                ? [NSString stringWithUTF8String:detail]
-                                                : @"Native NeoForge server preparation failed."}];
-        }
-        return NO;
-    }
-    NSData *data = [NSData dataWithBytes:buffer length:strlen(buffer)];
-    NSDictionary *value = [NSJSONSerialization JSONObjectWithData:data options:0 error:error];
-    if (![value isKindOfClass:[NSDictionary class]]) return NO;
-    if (result) *result = value;
-    return YES;
++ (BOOL)installNeoForgeServerFromInstaller:(NSString *)installerPath
+                               instanceRoot:(NSString *)instanceRoot
+                          vanillaServerJar:(NSString *)vanillaServerJar
+                                  javaHome:(NSString *)javaHome
+                                  progress:(void (^)(double, NSString *))progress
+                                    result:(NSDictionary **)result
+                                     error:(NSError **)error {
+    return [ForgeDirectInstaller installForgeServerFromInstaller:installerPath
+                                                 instanceRoot:instanceRoot
+                                            vanillaServerJar:vanillaServerJar
+                                                  javaHome:javaHome
+                                                        progress:progress
+                                                           result:result
+                                                            error:error];
 }
 
+#if !defined(AMETHYST_SERVER_RUNTIME)
 #pragma mark - New format (NeoForge 1.20.1+)
 
 + (BOOL)installNewFormat:(NSDictionary *)installProfile
@@ -989,51 +979,14 @@ NSString *const NeoForgeDirectInstallerErrorDomain = @"NeoForgeDirectInstallerEr
         return NO;
     }
 
-    // 用 NSURLSession 同步下载，带 60 秒超时（避免弱网下 dataWithContentsOfURL 挂死）
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
-    request.timeoutInterval = 60.0;
-    request.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
-    // 添加 User-Agent：参照 FCL 使用浏览器风格 UA，提升 BMCLAPI/Cloudflare 源兼容性。
-    [request setValue:@"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15" forHTTPHeaderField:@"User-Agent"];
-    [request setValue:@"application/java-archive,*/*;q=0.9" forHTTPHeaderField:@"Accept"];
-
-    __block NSData *resultData = nil;
-    __block NSError *resultError = nil;
-    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
-
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:request
-                                                                     completionHandler:^(NSData *data, NSURLResponse *response, NSError *taskError) {
-        if (taskError) {
-            resultError = taskError;
-        } else if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
-            NSInteger statusCode = [(NSHTTPURLResponse *)response statusCode];
-            if (statusCode >= 400) {
-                resultError = [NSError errorWithDomain:NeoForgeDirectInstallerErrorDomain
-                                                   code:statusCode
-                                               userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"HTTP %ld: %@", (long)statusCode, urlString]}];
-            } else {
-                resultData = data;
-            }
-        } else {
-            resultData = data;
-        }
-        dispatch_semaphore_signal(semaphore);
-    }];
-    [task resume];
-    long waitResult = dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 70 * NSEC_PER_SEC));
-    if (waitResult != 0) {
-        // 信号量超时：取消 task 释放网络资源，避免后台 task 持续运行导致临时内存泄漏
-        [task cancel];
-        if (error) {
-            *error = [NSError errorWithDomain:NeoForgeDirectInstallerErrorDomain
-                                         code:NSURLErrorTimedOut
-                                     userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:localize(@"i18n_str_1129", nil), urlString]}];
-        }
-        return NO;
-    }
-
-    if (resultError) {
-        if (error) *error = resultError;
+    // 与 Amethyst 原有安装器一致，直接在后台工作线程同步读取 NSData，
+    // 不通过 NSURLSession completion block 跨线程回写 __block 对象。
+    NSError *requestError = nil;
+    NSData *resultData = [NSData dataWithContentsOfURL:url
+                                               options:NSDataReadingMappedIfSafe
+                                                 error:&requestError];
+    if (requestError) {
+        if (error) *error = requestError;
         return NO;
     }
     if (!resultData || resultData.length == 0) {
@@ -1190,5 +1143,6 @@ NSString *const NeoForgeDirectInstallerErrorDomain = @"NeoForgeDirectInstallerEr
 + (NSString *)mavenNameToPath:(NSString *)name {
     return [self mavenPathToRelativePath:name];
 }
+#endif
 
 @end

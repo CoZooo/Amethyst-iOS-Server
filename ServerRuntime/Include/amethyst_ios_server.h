@@ -14,7 +14,7 @@
 extern "C" {
 #endif
 
-#define AIS_ABI_VERSION 6u
+#define AIS_ABI_VERSION 7u
 
 typedef enum ais_result {
     AIS_OK = 0,
@@ -138,6 +138,20 @@ AIS_EXPORT ais_result ais_java_get_exit_code(int *exit_code);
  * The pointer remains valid until the next call that changes native state.
  */
 AIS_EXPORT const char *ais_last_error(void);
+
+/**
+ * Installs a Forge or NeoForge server through Amethyst's native direct
+ * installer. The result buffer receives a UTF-8 JSON launch descriptor.
+ */
+AIS_EXPORT int ais_forge_server_install(const char *installer_path,
+                                        const char *instance_root,
+                                        const char *vanilla_server_jar,
+                                        const char *java_home,
+                                        char *result_buffer,
+                                        size_t result_capacity);
+
+/** Returns the most recent native Forge/NeoForge installer error. */
+AIS_EXPORT const char *ais_forge_server_last_error(void);
 
 #ifdef __cplusplus
 }

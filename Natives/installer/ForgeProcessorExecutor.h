@@ -68,6 +68,21 @@ typedef NS_ENUM(NSInteger, ForgeProcessorExecutorErrorCode) {
                         progress:(nullable void (^)(double progress, NSString *stageMessage))progress
                            error:(NSError **)error;
 
+/// Server-side variant used by the Amethyst Forge/NeoForge server installers.
+/// The processor graph is resolved with the `server` data/side and the supplied
+/// vanilla server JAR; no client JAR is downloaded or substituted.
++ (BOOL)runProcessorsWithProfile:(NSDictionary *)installProfile
+                   installerPath:(NSString *)installerPath
+                minecraftVersion:(NSString *)minecraftVersion
+                      mainGameDir:(NSString *)mainGameDir
+                 vanillaJarPath:(nullable NSString *)vanillaJarPath
+                            side:(NSString *)side
+                         javaHome:(nullable NSString *)javaHome
+                     baseProgress:(double)baseProgress
+                    progressSpan:(double)progressSpan
+                        progress:(nullable void (^)(double progress, NSString *stageMessage))progress
+                           error:(NSError **)error;
+
 /// 当前进程是否已用 headless JVM 跑过 processors。
 /// 为 YES 时游戏启动必须重启 app（进程内 JVM 只能创建一次）。
 + (BOOL)jvmUsedThisProcess;

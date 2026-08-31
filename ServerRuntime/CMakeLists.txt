@@ -4,6 +4,11 @@ project(AmethystIOSServerRuntime VERSION 0.1.0 LANGUAGES C)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     enable_language(CXX OBJC)
+    add_compile_options(
+        -Wno-nullability-completeness
+        -Wno-objc-property-no-attribute
+        -Wno-nonnull
+    )
 endif()
 
 add_library(AmethystIOSServer STATIC
@@ -15,7 +20,9 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
         Sources/apple_jli_main.cpp
         Sources/dyld_bypass_runtime_compat.m
         ../Natives/dyld_bypass_validation.m
-        ../Natives/installer/ForgeServerInstallerAdapter.m
+        ../Natives/installer/ForgeDirectInstaller.m
+        ../Natives/installer/NeoForgeDirectInstaller.m
+        ../Natives/installer/ForgeProcessorExecutor.m
         ../Natives/external/fishhook/fishhook.c
     )
     set_source_files_properties(
@@ -38,7 +45,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     )
     target_compile_options(AmethystIOSServer PRIVATE
         $<$<COMPILE_LANGUAGE:OBJC>:-fobjc-arc>
+        $<$<COMPILE_LANGUAGE:OBJC>:-Wno-nullability-completeness>
+        $<$<COMPILE_LANGUAGE:OBJC>:-Wno-objc-property-no-attribute>
     )
+    target_compile_definitions(AmethystIOSServer PRIVATE AMETHYST_SERVER_RUNTIME=1)
 endif()
 
 target_include_directories(AmethystIOSServer

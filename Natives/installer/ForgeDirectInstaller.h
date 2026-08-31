@@ -20,6 +20,7 @@ typedef NS_ENUM(NSInteger, ForgeDirectInstallerErrorCode) {
 
 @interface ForgeDirectInstaller : NSObject
 
+#if !defined(AMETHYST_SERVER_RUNTIME)
 + (BOOL)installForgeFromInstaller:(NSString *)installerPath
                         versionId:(NSString *)versionId
                             error:(NSError **)error;
@@ -39,15 +40,19 @@ typedef NS_ENUM(NSInteger, ForgeDirectInstallerErrorCode) {
                             error:(NSError **)error;
 
 + (BOOL)isNewFormatInstaller:(NSString *)installerPath;
+#endif
 
 + (BOOL)ensureParentVersionExists:(NSString *)minecraftVersion error:(NSError **)error;
 
-/// MSLX server adapter: keeps Amethyst's installer parsing rules while using
-/// an instance root and server-side paths instead of launcher profiles.
-+ (BOOL)prepareForgeServerInstaller:(NSString *)installerPath
-                         instanceRoot:(NSString *)instanceRoot
-                    vanillaServerJar:(NSString *)vanillaServerJar
-                              result:(NSDictionary **)result
-                               error:(NSError **)error;
+/// Installs a Forge server directly into the supplied instance root using the
+/// same installer implementation as the launcher. The caller supplies the
+/// already downloaded vanilla server JAR.
++ (BOOL)installForgeServerFromInstaller:(NSString *)installerPath
+                            instanceRoot:(NSString *)instanceRoot
+                       vanillaServerJar:(NSString *)vanillaServerJar
+                              javaHome:(NSString *)javaHome
+                               progress:(void (^)(double progress, NSString *stageMessage))progress
+                                 result:(NSDictionary **)result
+                                  error:(NSError **)error;
 
 @end

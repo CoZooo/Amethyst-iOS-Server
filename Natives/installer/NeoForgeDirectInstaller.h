@@ -20,6 +20,7 @@ typedef NS_ENUM(NSInteger, NeoForgeDirectInstallerErrorCode) {
 
 @interface NeoForgeDirectInstaller : NSObject
 
+#if !defined(AMETHYST_SERVER_RUNTIME)
 + (BOOL)installNeoForgeFromInstaller:(NSString *)installerPath
                            versionId:(NSString *)versionId
                                error:(NSError **)error;
@@ -38,12 +39,16 @@ typedef NS_ENUM(NSInteger, NeoForgeDirectInstallerErrorCode) {
                                error:(NSError **)error;
 
 + (BOOL)isNewFormatInstaller:(NSString *)installerPath;
+#endif
 
-/// MSLX server adapter shared with the NeoForge installer path.
-+ (BOOL)prepareNeoForgeServerInstaller:(NSString *)installerPath
-                           instanceRoot:(NSString *)instanceRoot
-                      vanillaServerJar:(NSString *)vanillaServerJar
-                                result:(NSDictionary **)result
-                                 error:(NSError **)error;
+/// Installs a NeoForge server directly into the supplied instance root using
+/// the same installer implementation as the launcher.
++ (BOOL)installNeoForgeServerFromInstaller:(NSString *)installerPath
+                               instanceRoot:(NSString *)instanceRoot
+                          vanillaServerJar:(NSString *)vanillaServerJar
+                                  javaHome:(NSString *)javaHome
+                                  progress:(void (^)(double progress, NSString *stageMessage))progress
+                                    result:(NSDictionary **)result
+                                     error:(NSError **)error;
 
 @end

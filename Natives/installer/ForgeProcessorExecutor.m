@@ -22,20 +22,98 @@
 //
 
 #import "ForgeProcessorExecutor.h"
+#if !defined(AMETHYST_SERVER_RUNTIME)
 #import "JavaLauncher.h"
 #import "LauncherPreferences.h"
 #import "utils.h"
+#endif
 #import "external/UnzipKit/UZKArchive.h"
 
+#if defined(AMETHYST_SERVER_RUNTIME)
+#include "amethyst_ios_server.h"
+#include <unistd.h>
+#include <stdint.h>
+#endif
+
 #import <CommonCrypto/CommonDigest.h>
+
+#if defined(AMETHYST_SERVER_RUNTIME)
+// ServerRuntime intentionally does not link Amethyst's launcher/UI helpers.
+// Keep the shared installer logic self-contained in that build.
+static NSString *AISServerMessage(NSString *key, NSDictionary *args)
+{
+    (void)args;
+    // ServerRuntime is a static library and does not link Amethyst's
+    // launcher localisation helper. Returning the lookup key here turns a
+    // useful processor error into messages such as "i18n_str_1159".
+    // Keep the installer diagnostics readable in the MSLX host as well.
+    NSDictionary<NSString *, NSString *> *messages = @{
+        @"i18n_str_97": @"未知错误",
+        @"i18n_str_1152": @"JIT 未启用",
+        @"i18n_str_1153": @"JLI_Launch 符号缺失",
+        @"i18n_str_1154": @"没有满足版本要求的 Java 运行时",
+        @"i18n_str_1155": @"加载 libjli 失败",
+        @"i18n_str_1156": @"本进程已创建过 JVM（需重启 App）",
+        @"i18n_str_1157": @"mainClass 为空",
+        @"i18n_str_1158": @"JLI_Launch 返回 %d",
+        @"i18n_str_1159": @"安装任务执行环境启动失败：%@。%@",
+        @"i18n_str_1161": @"请检查 JIT / Java 运行时设置后重试。",
+        @"i18n_str_1162": @"安装任务已结束但无法读取状态文件 %@",
+        @"i18n_str_1163": @"安装任务执行失败%@：\n%@",
+        @"i18n_str_2049": @"请重启 App 后重试。"
+    };
+    return messages[key] ?: key ?: @"";
+}
+#define localize(key, args) AISServerMessage((key), (args))
+#define getPrefObject(key) nil
+#endif
 
 NSString *const ForgeProcessorExecutorErrorDomain = @"ForgeProcessorExecutorErrorDomain";
 
 // headless JVM 中运行的 processor runner 主类
 static NSString *const kProcessorRunnerMainClass = @"net.kdt.pojavlaunch.tools.ForgeProcessorRunner";
 
-static NSString *const kUserAgent =
-    @"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
+#if defined(AMETHYST_SERVER_RUNTIME)
+/// Drain the runtime-owned Java pipes while the one-shot processor JVM is
+/// alive.  The normal server path has EmbeddedMinecraftServer.PumpConsole(),
+/// but Forge installation runs before that object starts its pump.
+static void AISDrainProcessorConsole(NSMutableString *output)
+{
+    uint8_t buffer[8192];
+    for (ais_console_stream stream = AIS_CONSOLE_STDOUT;
+         stream <= AIS_CONSOLE_STDERR;
+         stream++) {
+        for (;;) {
+            int count = ais_console_read(stream, buffer, sizeof(buffer));
+            if (count <= 0) {
+                break;
+            }
+
+            NSString *chunk = [[NSString alloc] initWithBytes:buffer
+                                                        length:(NSUInteger)count
+                                                      encoding:NSUTF8StringEncoding];
+            if (chunk.length == 0) {
+                chunk = [[NSString alloc] initWithData:
+                    [NSData dataWithBytes:buffer length:(NSUInteger)count]
+                                  encoding:NSISOLatin1StringEncoding];
+            }
+            if (chunk.length == 0) {
+                continue;
+            }
+
+            NSLog(@"[ForgeProcExec][%@] %@",
+                  stream == AIS_CONSOLE_STDERR ? @"stderr" : @"stdout",
+                  chunk);
+            if (output.length < 32768) {
+                NSUInteger remaining = 32768 - output.length;
+                [output appendString:chunk.length <= remaining
+                    ? chunk
+                    : [chunk substringToIndex:remaining]];
+            }
+        }
+    }
+}
+#endif
 
 static NSString *const kManifestURLOfficial = @"https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
 static NSString *const kManifestURLBMCLAPI = @"https://bmclapi2.bangbang93.com/mc/game/version_manifest_v2.json";
@@ -57,6 +135,30 @@ static const double kInnerProcessorsStart = 0.45;
                     progressSpan:(double)progressSpan
                         progress:(void (^)(double, NSString *))progress
                            error:(NSError **)error {
+    return [self runProcessorsWithProfile:installProfile
+                            installerPath:installerPath
+                         minecraftVersion:minecraftVersion
+                               mainGameDir:mainGameDir
+                            vanillaJarPath:nil
+                                      side:@"client"
+                                  javaHome:nil
+                              baseProgress:baseProgress
+                             progressSpan:progressSpan
+                                 progress:progress
+                                    error:error];
+}
+
++ (BOOL)runProcessorsWithProfile:(NSDictionary *)installProfile
+                   installerPath:(NSString *)installerPath
+                minecraftVersion:(NSString *)minecraftVersion
+                      mainGameDir:(NSString *)mainGameDir
+                 vanillaJarPath:(NSString *)vanillaJarPath
+                            side:(NSString *)side
+                         javaHome:(NSString *)javaHome
+                     baseProgress:(double)baseProgress
+                    progressSpan:(double)progressSpan
+                        progress:(void (^)(double, NSString *))progress
+                           error:(NSError **)error {
     void (^report)(double, NSString *) = ^(double inner, NSString *msg) {
         double p = baseProgress + progressSpan * inner;
         if (p > baseProgress + progressSpan) p = baseProgress + progressSpan;
@@ -69,7 +171,11 @@ static const double kInnerProcessorsStart = 0.45;
 
     // 前置防御：本进程已创建过 JVM（跑过游戏或跑过一次 processors），
     // 再次 JLI_Launch 必然崩溃，引导用户重启 app。
+#if defined(AMETHYST_SERVER_RUNTIME)
+    if (ais_java_is_running() || ais_java_has_exited()) {
+#else
     if (JVMUsedInProcess()) {
+#endif
         NSLog(@"[ForgeProcExec] JVM already created in this process, restart required");
         if (error) {
             *error = [NSError errorWithDomain:ForgeProcessorExecutorErrorDomain
@@ -103,7 +209,9 @@ static const double kInnerProcessorsStart = 0.45;
     }
 
     // ------------------------------------------------------------------
-    // 1. 构建 vars：data.*.client 逐项 parseLiteral
+    NSString *processorSide = side.length > 0 ? side : @"client";
+
+    // 1. 构建 vars：data.*.<side> 逐项 parseLiteral
     //    （plain 值从安装器 zip 解压到 cacheDir），再补充系统变量
     // ------------------------------------------------------------------
     report(0.0, localize(@"i18n_str_1321", nil));
@@ -111,29 +219,44 @@ static const double kInnerProcessorsStart = 0.45;
                                    installerPath:installerPath
                                    librariesDir:librariesDir
                                        cacheDir:cacheDir
+                                            side:processorSide
                                           error:error];
     if (!vars) {
         return NO;
     }
 
-    NSString *vanillaJarPath = [mainGameDir stringByAppendingPathComponent:
-        [NSString stringWithFormat:@"versions/%@/%@.jar", minecraftVersion, minecraftVersion]];
-    vars[@"SIDE"] = @"client";
-    vars[@"MINECRAFT_JAR"] = vanillaJarPath;
-    vars[@"MINECRAFT_VERSION"] = vanillaJarPath;
+    NSString *resolvedVanillaJarPath = vanillaJarPath;
+    if (resolvedVanillaJarPath.length == 0) {
+        resolvedVanillaJarPath = [mainGameDir stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"versions/%@/%@.jar", minecraftVersion, minecraftVersion]];
+    }
+    vars[@"SIDE"] = processorSide;
+    vars[@"MINECRAFT_JAR"] = resolvedVanillaJarPath;
+    vars[@"MINECRAFT_VERSION"] = minecraftVersion;
     vars[@"ROOT"] = mainGameDir;
     vars[@"INSTALLER"] = installerPath;
     vars[@"LIBRARY_DIR"] = librariesDir;
 
     // ------------------------------------------------------------------
-    // 2. 确保原版 client.jar 存在（jarsplitter/binarypatcher 的输入）
+    // 2. Client installs fetch the vanilla client JAR. Server installs use
+    // the caller-provided server JAR and must never replace it with client.jar.
     // ------------------------------------------------------------------
     report(kInnerVanillaJarStart, localize(@"i18n_str_1322", nil));
-    if (![self ensureVanillaClientJar:minecraftVersion
+    if ([processorSide isEqualToString:@"client"] &&
+        ![self ensureVanillaClientJar:minecraftVersion
                           mainGameDir:mainGameDir
                              progress:^(double inner, NSString *msg) {
         report(kInnerVanillaJarStart + (kInnerMojmapsStart - kInnerVanillaJarStart) * inner, msg);
     } error:error]) {
+        return NO;
+    }
+    if (![NSFileManager.defaultManager fileExistsAtPath:resolvedVanillaJarPath]) {
+        if (error) {
+            *error = [NSError errorWithDomain:ForgeProcessorExecutorErrorDomain
+                                         code:ForgeProcessorExecutorErrorDownloadFailed
+                                     userInfo:@{NSLocalizedDescriptionKey:
+                                                    [NSString stringWithFormat:@"原版 %@ JAR 不存在：%@", processorSide, resolvedVanillaJarPath]}];
+        }
         return NO;
     }
 
@@ -145,6 +268,7 @@ static const double kInnerProcessorsStart = 0.45;
                      librariesDir:librariesDir
                              vars:vars
                      mainGameDir:mainGameDir
+                              side:processorSide
                           progress:^(double inner, NSString *msg) {
         report(kInnerMojmapsStart + (kInnerProcessorsStart - kInnerMojmapsStart) * inner, msg);
     } error:error]) {
@@ -152,12 +276,13 @@ static const double kInnerProcessorsStart = 0.45;
     }
 
     // ------------------------------------------------------------------
-    // 4. 构建 client side 命令清单（outputs 已就绪的命令跳过）
+    // 4. 构建指定 side 的命令清单（outputs 已就绪的命令跳过）
     // ------------------------------------------------------------------
     report(kInnerProcessorsStart, localize(@"i18n_str_1324", nil));
     NSArray *commands = [self buildCommands:processors
                                librariesDir:librariesDir
                                       vars:vars
+                                      side:processorSide
                                      error:error];
     if (!commands) {
         return NO;
@@ -218,14 +343,185 @@ static const double kInnerProcessorsStart = 0.45;
     // 按原版 MC 版本推断 processor 所需 Java 大版本（对齐游戏运行时要求）
     int minJava = [self inferJavaMajorForMinecraft:minecraftVersion];
     NSLog(@"[ForgeProcExec] Launching headless JVM (minJava=%d)", minJava);
-    int ret = launchHeadlessJVM(kProcessorRunnerMainClass,
-                                @[commandsPath, statusPath],
-                                minJava);
+    int ret = 0;
+#if defined(AMETHYST_SERVER_RUNTIME)
+    if (javaHome.length == 0) {
+        if (error) *error = [NSError errorWithDomain:ForgeProcessorExecutorErrorDomain
+                                                  code:ForgeProcessorExecutorErrorLaunchFailed
+                                              userInfo:@{NSLocalizedDescriptionKey: @"Forge processor 缺少 Java Runtime 路径。"}];
+        pollDone = YES;
+        return NO;
+    }
+    ais_runtime_state runtimeState = ais_runtime_get_state();
+    if (runtimeState == AIS_RUNTIME_UNINITIALIZED || runtimeState == AIS_RUNTIME_FAILED) {
+        ais_result initResult = ais_runtime_initialize(javaHome.UTF8String);
+        if (initResult != AIS_OK) {
+            if (error) *error = [NSError errorWithDomain:ForgeProcessorExecutorErrorDomain
+                                                      code:ForgeProcessorExecutorErrorLaunchFailed
+                                                  userInfo:@{NSLocalizedDescriptionKey:
+                                                                 [NSString stringWithFormat:@"Java Runtime 初始化失败：%s", ais_last_error() ?: "unknown"]}];
+            pollDone = YES;
+            return NO;
+        }
+    }
+    if (ais_console_prepare() != AIS_OK) {
+        if (error) *error = [NSError errorWithDomain:ForgeProcessorExecutorErrorDomain
+                                                  code:ForgeProcessorExecutorErrorLaunchFailed
+                                              userInfo:@{NSLocalizedDescriptionKey:
+                                                                 [NSString stringWithFormat:@"Java Console 初始化失败：%s", ais_last_error() ?: "unknown"]}];
+        pollDone = YES;
+        return NO;
+    }
+    NSString *runner = [[NSBundle mainBundle] pathForResource:@"forge-processor-runner" ofType:@"jar" inDirectory:@"JavaTools"];
+    NSString *gson = [[NSBundle mainBundle] pathForResource:@"gson" ofType:@"jar" inDirectory:@"JavaTools"];
+    if (runner.length == 0 || gson.length == 0) {
+        if (error) *error = [NSError errorWithDomain:ForgeProcessorExecutorErrorDomain
+                                                  code:ForgeProcessorExecutorErrorLaunchFailed
+                                              userInfo:@{NSLocalizedDescriptionKey: @"App 缺少 ForgeProcessorRunner 工具。"}];
+        pollDone = YES;
+        return NO;
+    }
+    NSString *java = [javaHome stringByAppendingPathComponent:@"bin/java"];
+    NSString *processorHome = [mainGameDir stringByAppendingPathComponent:@".temp/forge_processor_home"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:processorHome
+                               withIntermediateDirectories:YES
+                                                attributes:nil
+                                                     error:nil];
+    NSString *frameworksPath = [NSBundle mainBundle].bundlePath
+        ? [[NSBundle mainBundle].bundlePath stringByAppendingPathComponent:@"Frameworks"]
+        : @"";
+    NSArray<NSString *> *arguments = @[
+        java, @"-XstartOnFirstThread", @"-Djava.awt.headless=true",
+        @"-Xms64M", @"-Xmx1G",
+        [NSString stringWithFormat:@"-Djava.library.path=%@", frameworksPath],
+        [NSString stringWithFormat:@"-Duser.dir=%@", mainGameDir],
+        [NSString stringWithFormat:@"-Duser.home=%@", processorHome],
+        [NSString stringWithFormat:@"-Duser.timezone=%@", NSTimeZone.localTimeZone.name],
+        @"-Dfile.encoding=UTF-8",
+        @"-Dlog4j2.formatMsgNoLookups=true", @"-XX:+UnlockExperimentalVMOptions",
+        @"-XX:+DisablePrimordialThreadGuardPages", @"-XX:ReservedCodeCacheSize=64m",
+        @"-XX:InitialCodeCacheSize=16m", @"-XX:CodeCacheExpansionSize=4m",
+        @"-XX:+MirrorMappedCodeCache", @"-cp", [NSString stringWithFormat:@"%@:%@", runner, gson],
+        kProcessorRunnerMainClass, commandsPath, statusPath
+    ];
+    NSString *originalWorkingDirectory = NSFileManager.defaultManager.currentDirectoryPath;
+    if (![[NSFileManager defaultManager] changeCurrentDirectoryPath:mainGameDir]) {
+        if (error) *error = [NSError errorWithDomain:ForgeProcessorExecutorErrorDomain
+                                                  code:ForgeProcessorExecutorErrorLaunchFailed
+                                              userInfo:@{NSLocalizedDescriptionKey:
+                                                             [NSString stringWithFormat:@"无法进入 processor 工作目录：%@", mainGameDir]}];
+        pollDone = YES;
+        return NO;
+    }
+    const char *argv[64] = {0};
+    int argc = (int)MIN(arguments.count, 64);
+    for (int index = 0; index < argc; index++) argv[index] = arguments[index].UTF8String;
+    ais_result launchResult = ais_java_start(argc, argv);
+    if (launchResult != AIS_OK) {
+        if (originalWorkingDirectory.length > 0) {
+            [[NSFileManager defaultManager] changeCurrentDirectoryPath:originalWorkingDirectory];
+        }
+        if (error) *error = [NSError errorWithDomain:ForgeProcessorExecutorErrorDomain
+                                                  code:ForgeProcessorExecutorErrorLaunchFailed
+                                              userInfo:@{NSLocalizedDescriptionKey:
+                                                                 [NSString stringWithFormat:@"processor JVM 启动失败：%s", ais_last_error() ?: "unknown"]}];
+        pollDone = YES;
+        return NO;
+    }
+    NSMutableString *processorOutput = [NSMutableString string];
+    while (!ais_java_has_exited()) {
+        /*
+         * ais_java_is_running() becomes true before JLI_Launch has loaded
+         * libjvm.  On iOS 26+, libjvm and processor libraries can still
+         * perform executable mappings after ForgeProcessorRunner enters its
+         * main class.  Keep the Universal JIT debugger attached for the
+         * complete one-shot processor lifetime so every hooked_mmap call can
+         * be serviced.
+         */
+        AISDrainProcessorConsole(processorOutput);
+        usleep(20000);
+    }
+    // The final launcher diagnostics are commonly written immediately before
+    // JLI_Launch returns, so perform a final non-blocking drain after exit.
+    AISDrainProcessorConsole(processorOutput);
+    /*
+     * Detaching after JLI has exited cannot race with HotSpot's loader and
+     * avoids sending a JIT breakpoint to a debugger that has already gone
+     * away.  This is intentionally later than the generic "JVM running"
+     * state, which is only a launch-state indicator, not a readiness signal.
+     */
+    ais_result debuggerReleaseResult = ais_jit_release_debugger_after_jvm_ready();
+    if (debuggerReleaseResult != AIS_OK) {
+        NSLog(@"[ForgeProcExec] Universal JIT debugger detach returned %d: %s",
+              debuggerReleaseResult,
+              ais_last_error() ?: "unknown");
+    }
+    (void)ais_java_get_exit_code(&ret);
+    if (originalWorkingDirectory.length > 0) {
+        [[NSFileManager defaultManager] changeCurrentDirectoryPath:originalWorkingDirectory];
+    }
+#else
+    ret = launchHeadlessJVM(kProcessorRunnerMainClass,
+                            @[commandsPath, statusPath],
+                            minJava);
+#endif
     pollDone = YES;
 
     if (ret != 0) {
         NSLog(@"[ForgeProcExec] launchHeadlessJVM returned %d", ret);
         if (error) {
+#if defined(AMETHYST_SERVER_RUNTIME)
+            NSString *reason = nil;
+            switch (ret) {
+                case AIS_ERROR_INVALID_ARGUMENT:
+                    reason = @"启动参数无效";
+                    break;
+                case AIS_ERROR_JIT_UNAVAILABLE:
+                    reason = @"JIT 不可用";
+                    break;
+                case AIS_ERROR_RUNTIME_NOT_FOUND:
+                    reason = @"找不到 Java Runtime";
+                    break;
+                case AIS_ERROR_DLOPEN_FAILED:
+                    reason = @"加载 Java Runtime 失败";
+                    break;
+                case AIS_ERROR_JLI_SYMBOL_MISSING:
+                    reason = @"找不到 JLI_Launch";
+                    break;
+                case AIS_ERROR_INVALID_STATE:
+                    reason = @"Java Runtime 状态无效";
+                    break;
+                case AIS_ERROR_JVM_ALREADY_USED:
+                    reason = @"本进程已经使用过 JVM";
+                    break;
+                case AIS_ERROR_ALLOCATION_FAILED:
+                    reason = @"无法分配 Java 启动参数";
+                    break;
+                case AIS_ERROR_THREAD_CREATE_FAILED:
+                    reason = @"无法创建 Java 启动线程";
+                    break;
+                default:
+                    reason = [NSString stringWithFormat:@"JLI_Launch 返回 %d", ret];
+                    break;
+            }
+            const char *nativeError = ais_last_error();
+            NSString *nativeDetail = nativeError != NULL && nativeError[0] != '\0'
+                ? [NSString stringWithUTF8String:nativeError]
+                : @"原生运行时未提供更多错误信息";
+            NSString *consoleDetail = processorOutput.length > 0
+                ? processorOutput
+                : @"Java 未输出错误信息";
+            NSString *suggestion = (ret == AIS_ERROR_JVM_ALREADY_USED)
+                ? @"请重启 App 后重试。"
+                : @"请检查 JIT / Java 运行时设置后重试。";
+            *error = [NSError errorWithDomain:ForgeProcessorExecutorErrorDomain
+                                         code:ForgeProcessorExecutorErrorLaunchFailed
+                                     userInfo:@{NSLocalizedDescriptionKey:
+                                                    [NSString stringWithFormat:@"安装任务执行环境启动失败（返回码 %d）：%@。%@ 原生详情：%@",
+                                               ret, reason, suggestion,
+                                               [NSString stringWithFormat:@"原生：%@；Java 输出：%@",
+                                                   nativeDetail, consoleDetail]]}];
+#else
             NSString *reason = nil;
             if (ret == -1) reason = localize(@"i18n_str_1152", nil);
             else if (ret == -2) reason = localize(@"i18n_str_1153", nil);
@@ -239,6 +535,7 @@ static const double kInnerProcessorsStart = 0.45;
                                      userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:localize(@"i18n_str_1159", nil),
                                          reason,
                                          (ret == -5 || ret == -1) ? localize(@"i18n_str_2049", nil) : localize(@"i18n_str_1161", nil)]}];
+#endif
         }
         return NO;
     }
@@ -278,7 +575,11 @@ static const double kInnerProcessorsStart = 0.45;
 }
 
 + (BOOL)jvmUsedThisProcess {
+#if defined(AMETHYST_SERVER_RUNTIME)
+    return ais_java_is_running() || ais_java_has_exited();
+#else
     return JVMUsedInProcess();
+#endif
 }
 
 #pragma mark - vars 构建
@@ -290,7 +591,8 @@ static const double kInnerProcessorsStart = 0.45;
                      installerPath:(NSString *)installerPath
                      librariesDir:(NSString *)librariesDir
                          cacheDir:(NSString *)cacheDir
-                            error:(NSError **)error {
+                              side:(NSString *)side
+                             error:(NSError **)error {
     NSMutableDictionary *vars = [NSMutableDictionary dictionary];
 
     NSError *openError = nil;
@@ -309,11 +611,11 @@ static const double kInnerProcessorsStart = 0.45;
     for (NSString *key in data) {
         NSDictionary *entry = [data[key] isKindOfClass:[NSDictionary class]] ? data[key] : nil;
         if (!entry) continue;
-        NSString *clientValue = [entry[@"client"] isKindOfClass:[NSString class]] ? entry[@"client"] : nil;
-        if (!clientValue) continue;
+        NSString *sideValue = [entry[side] isKindOfClass:[NSString class]] ? entry[side] : nil;
+        if (!sideValue) continue;
 
         // data 阶段 vars 为空（对齐 ZL2：parseLiteral 默认 emptyMap）
-        NSString *resolved = [self parseLiteral:clientValue
+        NSString *resolved = [self parseLiteral:sideValue
                                    librariesDir:librariesDir
                                           vars:@{}
                                 plainConverter:^NSString *(NSString *plain) {
@@ -357,6 +659,7 @@ static const double kInnerProcessorsStart = 0.45;
 + (NSArray<NSDictionary *> *)buildCommands:(NSArray *)processors
                               librariesDir:(NSString *)librariesDir
                                      vars:(NSDictionary *)vars
+                                     side:(NSString *)side
                                     error:(NSError **)error {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSMutableArray *commands = [NSMutableArray array];
@@ -366,8 +669,8 @@ static const double kInnerProcessorsStart = 0.45;
 
         // side 过滤（不看 args，避免 server-only 参数解析失败）
         NSArray *sides = [processor[@"sides"] isKindOfClass:[NSArray class]] ? processor[@"sides"] : nil;
-        BOOL isClient = (sides == nil) || [sides containsObject:@"client"];
-        if (!isClient) continue;
+        BOOL appliesToSide = (sides == nil) || [sides containsObject:side];
+        if (!appliesToSide) continue;
 
         NSArray *args = [processor[@"args"] isKindOfClass:[NSArray class]] ? processor[@"args"] : @[];
 
@@ -528,6 +831,7 @@ static const double kInnerProcessorsStart = 0.45;
               librariesDir:(NSString *)librariesDir
                       vars:(NSDictionary *)vars
                 mainGameDir:(NSString *)mainGameDir
+                        side:(NSString *)side
                   progress:(void (^)(double, NSString *))progress
                      error:(NSError **)error {
     NSString *mojmapsVersion = nil;
@@ -569,9 +873,10 @@ static const double kInnerProcessorsStart = 0.45;
     NSDictionary *versionJSON = [self ensureVersionJSON:mojmapsVersion mainGameDir:mainGameDir error:error];
     if (!versionJSON) return NO;
 
-    NSDictionary *clientMappings = [versionJSON[@"downloads"] isKindOfClass:[NSDictionary class]]
-        ? versionJSON[@"downloads"][@"client_mappings"] : nil;
-    if (![clientMappings isKindOfClass:[NSDictionary class]]) {
+    NSString *mappingKey = [side isEqualToString:@"server"] ? @"server_mappings" : @"client_mappings";
+    NSDictionary *mappings = [versionJSON[@"downloads"] isKindOfClass:[NSDictionary class]]
+        ? versionJSON[@"downloads"][mappingKey] : nil;
+    if (![mappings isKindOfClass:[NSDictionary class]]) {
         if (error) {
             *error = [NSError errorWithDomain:ForgeProcessorExecutorErrorDomain
                                          code:ForgeProcessorExecutorErrorDownloadFailed
@@ -580,7 +885,7 @@ static const double kInnerProcessorsStart = 0.45;
         return NO;
     }
 
-    return [self downloadArtifactFromVersionEntry:clientMappings
+    return [self downloadArtifactFromVersionEntry:mappings
                                            toPath:mojmapsOutput
                                           label:localize(@"i18n_str_1175", nil)
                                          progress:progress
@@ -641,10 +946,23 @@ static const double kInnerProcessorsStart = 0.45;
         [NSString stringWithFormat:@"%@.json", versionId]];
 
     if ([[NSFileManager defaultManager] fileExistsAtPath:jsonPath]) {
-        NSDictionary *existing = [NSJSONSerialization JSONObjectWithData:
-            [NSData dataWithContentsOfFile:jsonPath] options:0 error:nil];
-        if ([existing isKindOfClass:[NSDictionary class]] && existing[@"downloads"]) {
-            return existing;
+        // Keep the NSData strongly owned for the complete parse call.  This is
+        // deliberately written out instead of passing dataWithContentsOfFile:
+        // inline: Forge installation runs on a .NET thread and the previous
+        // inline form made it too easy to lose the object while Foundation was
+        // parsing a stale/partially-written cache file.
+        NSData *existingData = [NSData dataWithContentsOfFile:jsonPath];
+        if (existingData.length > 0) {
+            NSError *existingJSONError = nil;
+            id existingObject = [NSJSONSerialization JSONObjectWithData:existingData
+                                                                   options:0
+                                                                     error:&existingJSONError];
+            if ([existingObject isKindOfClass:[NSDictionary class]] &&
+                [existingObject[@"downloads"] isKindOfClass:[NSDictionary class]]) {
+                return (NSDictionary *)existingObject;
+            }
+            NSLog(@"[ForgeProcExec] Ignoring invalid cached version JSON %@: %@",
+                  jsonPath, existingJSONError.localizedDescription ?: @"invalid object");
         }
     }
 
@@ -658,26 +976,34 @@ static const double kInnerProcessorsStart = 0.45;
         : @[kManifestURLOfficial, kManifestURLBMCLAPI];
 
     NSData *manifestData = nil;
+    NSError *manifestDownloadError = nil;
     for (NSString *manifestURL in manifestURLs) {
-        manifestData = [self downloadDataFromURLString:manifestURL error:nil];
+        manifestData = [self downloadDataFromURLString:manifestURL error:&manifestDownloadError];
         if (manifestData) break;
     }
-    if (!manifestData) {
+    if (manifestData.length == 0) {
         if (error) {
             *error = [NSError errorWithDomain:ForgeProcessorExecutorErrorDomain
                                          code:ForgeProcessorExecutorErrorDownloadFailed
-                                     userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_1180", nil)}];
+                                     userInfo:@{NSLocalizedDescriptionKey:
+                                                    manifestDownloadError.localizedDescription ?: localize(@"i18n_str_1180", nil)}];
         }
         return nil;
     }
 
-    NSDictionary *manifest = [NSJSONSerialization JSONObjectWithData:manifestData options:0 error:nil];
+    NSError *manifestJSONError = nil;
+    id manifestObject = [NSJSONSerialization JSONObjectWithData:manifestData
+                                                          options:0
+                                                            error:&manifestJSONError];
+    NSDictionary *manifest = [manifestObject isKindOfClass:[NSDictionary class]]
+        ? (NSDictionary *)manifestObject : nil;
     NSArray *versions = [manifest isKindOfClass:[NSDictionary class]] ? manifest[@"versions"] : nil;
     if (![versions isKindOfClass:[NSArray class]]) {
         if (error) {
             *error = [NSError errorWithDomain:ForgeProcessorExecutorErrorDomain
                                          code:ForgeProcessorExecutorErrorDownloadFailed
-                                     userInfo:@{NSLocalizedDescriptionKey: localize(@"i18n_str_1181", nil)}];
+                                     userInfo:@{NSLocalizedDescriptionKey:
+                                                    manifestJSONError.localizedDescription ?: localize(@"i18n_str_1181", nil)}];
         }
         return nil;
     }
@@ -705,16 +1031,32 @@ static const double kInnerProcessorsStart = 0.45;
         : @[versionJSONURL, [self bmclapiURLFor:versionJSONURL]];
 
     NSData *jsonData = nil;
+    NSError *versionDownloadError = nil;
     for (NSString *url in jsonURLs) {
         if (!url) continue;
-        jsonData = [self downloadDataFromURLString:url error:nil];
+        jsonData = [self downloadDataFromURLString:url error:&versionDownloadError];
         if (jsonData) break;
     }
-    if (!jsonData) {
+    if (jsonData.length == 0) {
         if (error) {
             *error = [NSError errorWithDomain:ForgeProcessorExecutorErrorDomain
                                          code:ForgeProcessorExecutorErrorDownloadFailed
-                                     userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:localize(@"i18n_str_1183", nil), versionId]}];
+                                     userInfo:@{NSLocalizedDescriptionKey:
+                                                    versionDownloadError.localizedDescription ?: [NSString stringWithFormat:localize(@"i18n_str_1183", nil), versionId]}];
+        }
+        return nil;
+    }
+
+    NSError *versionJSONError = nil;
+    id versionObject = [NSJSONSerialization JSONObjectWithData:jsonData
+                                                         options:0
+                                                           error:&versionJSONError];
+    if (![versionObject isKindOfClass:[NSDictionary class]]) {
+        if (error) {
+            *error = [NSError errorWithDomain:ForgeProcessorExecutorErrorDomain
+                                         code:ForgeProcessorExecutorErrorDownloadFailed
+                                     userInfo:@{NSLocalizedDescriptionKey:
+                                                    versionJSONError.localizedDescription ?: [NSString stringWithFormat:@"版本 %@ 返回了无效 JSON。", versionId]}];
         }
         return nil;
     }
@@ -737,7 +1079,7 @@ static const double kInnerProcessorsStart = 0.45;
     }
 
     NSLog(@"[ForgeProcExec] Downloaded version JSON for %@ (%lu bytes)", versionId, (unsigned long)jsonData.length);
-    return [NSJSONSerialization JSONObjectWithData:jsonData options:0 error:nil];
+    return (NSDictionary *)versionObject;
 }
 
 /// 通用 artifact 下载：按版本 JSON 条目（url/sha1/size）下载到 toPath。
@@ -1108,54 +1450,37 @@ static const double kInnerProcessorsStart = 0.45;
     return 17; // 未知格式保守取 17
 }
 
-#pragma mark - 网络下载（对齐 ForgeDirectInstaller 的 NSURLSession + 信号量模式）
+#pragma mark - 网络下载
 
 + (NSData *)downloadDataFromURLString:(NSString *)urlString error:(NSError **)error {
+    if (error) *error = nil;
+
     NSURL *url = [NSURL URLWithString:urlString];
-    if (!url) return nil;
-
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
-    request.timeoutInterval = 60.0;
-    request.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
-    [request setValue:kUserAgent forHTTPHeaderField:@"User-Agent"];
-
-    __block NSData *resultData = nil;
-    __block NSError *resultError = nil;
-    dispatch_semaphore_t semaphore = dispatch_semaphore_create(0);
-
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:request
-                                                                   completionHandler:^(NSData *data, NSURLResponse *response, NSError *taskError) {
-        if (taskError) {
-            resultError = taskError;
-        } else if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
-            NSInteger statusCode = [(NSHTTPURLResponse *)response statusCode];
-            if (statusCode >= 400) {
-                resultError = [NSError errorWithDomain:ForgeProcessorExecutorErrorDomain
-                                                   code:statusCode
-                                               userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"HTTP %ld: %@", (long)statusCode, urlString]}];
-            } else {
-                resultData = data;
-            }
-        } else {
-            resultData = data;
-        }
-        dispatch_semaphore_signal(semaphore);
-    }];
-    [task resume];
-
-    long waitResult = dispatch_semaphore_wait(semaphore, dispatch_time(DISPATCH_TIME_NOW, 70 * NSEC_PER_SEC));
-    if (waitResult != 0) {
-        [task cancel];
+    if (!url || !url.scheme.length || !url.host.length) {
         if (error) {
             *error = [NSError errorWithDomain:ForgeProcessorExecutorErrorDomain
-                                         code:NSURLErrorTimedOut
-                                     userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:localize(@"i18n_str_1129", nil), urlString]}];
+                                         code:ForgeProcessorExecutorErrorDownloadFailed
+                                     userInfo:@{NSLocalizedDescriptionKey:
+                                                    [NSString stringWithFormat:@"无效下载地址：%@", urlString ?: @""]}];
         }
         return nil;
     }
 
-    if (error) *error = resultError;
-    return resultData;
+    // This method is only used for small, required metadata.  Keep the
+    // operation synchronous and return the NSData object directly so no
+    // NSURLSession completion block or semaphore can outlive the caller.
+    NSError *readError = nil;
+    NSData *data = [NSData dataWithContentsOfURL:url options:0 error:&readError];
+    if (data.length == 0) {
+        if (error) {
+            *error = readError ?: [NSError errorWithDomain:ForgeProcessorExecutorErrorDomain
+                                                       code:ForgeProcessorExecutorErrorDownloadFailed
+                                                   userInfo:@{NSLocalizedDescriptionKey:
+                                                                  [NSString stringWithFormat:localize(@"i18n_str_1129", nil), urlString]}];
+        }
+        return nil;
+    }
+    return data;
 }
 
 + (BOOL)downloadFileFromURLString:(NSString *)urlString toPath:(NSString *)destPath error:(NSError **)error {
