@@ -8,6 +8,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "../Sources/dyld_bypass_mapping_policy.h"
+
 typedef int (*ais_test_jli_launch_fn)(
     int argc,
     char **argv,
@@ -146,6 +148,65 @@ static void wait_for_runtime_state(ais_runtime_state expected)
 static void test_abi_version(void)
 {
     assert(ais_abi_version() == AIS_ABI_VERSION);
+}
+
+static void test_txm_prepares_successful_file_backed_executable_mappings(void)
+{
+    assert(ais_should_prepare_executable_mapping(
+        (const void *)0x1000,
+        4096u,
+        0x5,
+        17,
+        1) != 0);
+    assert(ais_should_prepare_executable_mapping(
+        (const void *)-1,
+        4096u,
+        0x5,
+        17,
+        1) == 0);
+    assert(ais_should_prepare_executable_mapping(
+        (const void *)0x1000,
+        4096u,
+        0x1,
+        17,
+        1) == 0);
+    assert(ais_should_prepare_executable_mapping(
+        (const void *)0x1000,
+        4096u,
+        0x5,
+        -1,
+        1) == 0);
+    assert(ais_should_prepare_executable_mapping(
+        (const void *)0x1000,
+        4096u,
+        0x5,
+        17,
+        0) == 0);
+
+    assert(ais_should_replace_executable_mapping(
+        (const void *)0x1000,
+        4096u,
+        0x5,
+        17,
+        1) != 0);
+    assert(ais_should_replace_executable_mapping(
+        (const void *)-1,
+        4096u,
+        0x5,
+        17,
+        1) == 0);
+    assert(ais_should_replace_executable_mapping(
+        (const void *)0x1000,
+        4096u,
+        0x5,
+        17,
+        0) == 0);
+
+    assert(ais_executable_reprepare_chunk_length(0u, 16384u) == 0u);
+    assert(ais_executable_reprepare_chunk_length(16384u, 0u) == 0u);
+    assert(ais_executable_reprepare_chunk_length(4096u, 16384u) == 4096u);
+    assert(ais_executable_reprepare_chunk_length(16384u, 16384u) == 16384u);
+    assert(ais_executable_reprepare_chunk_length(65536u, 16384u) == 16384u);
 }
 
 static void test_initialize_rejects_empty_java_home(void)
@@ -425,6 +486,7 @@ static void test_console_redirects_output_and_accepts_input(void)
 int main(void)
 {
     test_abi_version();
+    test_txm_prepares_successful_file_backed_executable_mappings();
     test_initialize_rejects_empty_java_home();
     test_jit_probe_reaches_a_terminal_status();
     test_jit_prepare_requires_a_successful_probe();

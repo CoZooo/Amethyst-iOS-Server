@@ -16,8 +16,14 @@
 
 #if defined(AMETHYST_SERVER_RUNTIME)
 #include "../ServerRuntime/Sources/dyld_bypass_runtime_compat.h"
+#include "../ServerRuntime/Sources/dyld_bypass_mapping_policy.h"
 #else
 #include "utils.h"
+#endif
+
+#if defined(AMETHYST_SERVER_RUNTIME)
+#undef NSDebugLog
+#define NSDebugLog(...) NSLog(__VA_ARGS__)
 #endif
 
 #define ASM(...) __asm__(#__VA_ARGS__)
@@ -35,8 +41,8 @@ extern void* __mmap(void *addr, size_t len, int prot, int flags, int fd, off_t o
 extern int __fcntl(int fildes, int cmd, void* param);
 
 // Since we're patching libsystem_kernel, we must avoid calling to its functions
-static void builtin_memcpy(char *target, char *source, size_t size) {
-    for (int i = 0; i < size; i++) {
+static void builtin_memcpy(char *target, const char *source, size_t size) {
+    for (size_t i = 0; i < size; i++) {
         target[i] = source[i];
     }
 }
@@ -85,23 +91,30 @@ bool redirectFunctionMirrored(char *name, void *patchAddr, void *target) {
     }
     // mirror `addr` (rx, JIT applied) to `mirrored` (rw)
     vm_address_t mirrored = 0;
+    vm_address_t mirroredBase = 0;
     vm_prot_t cur_prot, max_prot;
     kern_return_t ret = vm_remap(mach_task_self(), &mirrored, sizeof(patch), 0, VM_FLAGS_ANYWHERE, mach_task_self(), (vm_address_t)patchAddr, false, &cur_prot, &max_prot, VM_INHERIT_SHARE);
     if (ret != KERN_SUCCESS) {
-        NSDebugLog(@"[DyldLVBypass] vm_remap() fails at line %d", __LINE__);
+        NSDebugLog(@"[DyldLVBypass] vm_remap() fails at line %d (ret=%d)", __LINE__, ret);
         return FALSE;
     }
-    
+
+    mirroredBase = mirrored;
     mirrored += (vm_address_t)patchAddr & PAGE_MASK;
-    vm_protect(mach_task_self(), mirrored, sizeof(patch), NO,
-               VM_PROT_READ | VM_PROT_WRITE);
+    ret = vm_protect(mach_task_self(), mirroredBase, getpagesize(), NO,
+                     VM_PROT_READ | VM_PROT_WRITE);
+    if (ret != KERN_SUCCESS) {
+        NSDebugLog(@"[DyldLVBypass] vm_protect(mirror) fails at line %d (ret=%d)", __LINE__, ret);
+        vm_deallocate(mach_task_self(), mirroredBase, getpagesize());
+        return FALSE;
+    }
     builtin_memcpy((char *)mirrored, patch, sizeof(patch));
     *(void **)((char*)mirrored + 16) = target;
     sys_icache_invalidate((void*)patchAddr, sizeof(patch));
     
     NSDebugLog(@"[DyldLVBypass] hook %s succeed!", name);
     
-    vm_deallocate(mach_task_self(), mirrored, sizeof(patch));
+    vm_deallocate(mach_task_self(), mirroredBase, getpagesize());
     return TRUE;
 }
 // redirectFunction for iOS 26+ (non-TXM)
@@ -174,39 +187,101 @@ void* hooked_mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off
     if (fd == -1 || (prot & PROT_EXEC) == 0) {
         return map;
     }
-    
+
     // Handle some cases where it will still map but without executable permission
-    if (mprotect(map, len, prot) == -1) {
+    if (map != MAP_FAILED && mprotect(map, len, prot) == -1) {
         munmap(map, len);
         map = MAP_FAILED;
     }
+
+#if defined(AMETHYST_SERVER_RUNTIME)
+    /*
+     * On TXM devices a file-backed executable mapping can succeed even though
+     * it is not a valid executable mapping for an unsigned external image.
+     * Replace it with the anonymous executable-copy path before returning it
+     * to dyld. This is required for delayed Java libraries such as libawt.
+     */
+    BOOL has_txm = DeviceHasJITFlags(JIT_FLAG_HAS_TXM);
+    if (ais_should_replace_executable_mapping(map, len, prot, fd, has_txm)) {
+        munmap(map, len);
+        map = MAP_FAILED;
+    }
+#else
+    BOOL has_txm = DeviceHasJITFlags(JIT_FLAG_HAS_TXM);
+#endif
+
     if (map == MAP_FAILED) {
         //printf("[DyldLVBypass] mmap(prot=%d, flags=%d, fd=%d)\n", prot, flags, fd);
         map = __mmap(addr, len, prot, flags | MAP_PRIVATE | MAP_ANON, 0, 0);
-        /* Every anonymous executable fallback on TXM must be prepared by the
-         * attached Universal JIT debugger before control can enter it. */
-        if (DeviceHasJITFlags(JIT_FLAG_HAS_TXM)) {
+        if (map == MAP_FAILED) {
+            return MAP_FAILED;
+        }
+
+        if (has_txm) {
             JIT26PrepareRegion(map, len);
         }
         
         void *memoryLoadedFile = __mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, offset);
+        if (memoryLoadedFile == MAP_FAILED) {
+            munmap(map, len);
+            return MAP_FAILED;
+        }
         if (redirectFunction == redirectFunctionDirect) {
-            mprotect(map, len, PROT_READ | PROT_WRITE);
+            if (mprotect(map, len, PROT_READ | PROT_WRITE) != 0) {
+                munmap(memoryLoadedFile, len);
+                munmap(map, len);
+                return MAP_FAILED;
+            }
             memcpy(map, memoryLoadedFile, len);
-            mprotect(map, len, prot);
+            if (mprotect(map, len, prot) != 0) {
+                munmap(memoryLoadedFile, len);
+                munmap(map, len);
+                return MAP_FAILED;
+            }
         } else {
             // mirror `addr` (rx, JIT applied) to `mirrored` (rw)
             vm_address_t mirrored = 0;
             vm_prot_t cur_prot, max_prot;
             kern_return_t ret = vm_remap(mach_task_self(), &mirrored, len, 0, VM_FLAGS_ANYWHERE, mach_task_self(), (vm_address_t)map, false, &cur_prot, &max_prot, VM_INHERIT_SHARE);
             if(ret == KERN_SUCCESS) {
-                vm_protect(mach_task_self(), mirrored, len, NO,
-                           VM_PROT_READ | VM_PROT_WRITE);
+                if (vm_protect(mach_task_self(), mirrored, len, NO,
+                               VM_PROT_READ | VM_PROT_WRITE) != KERN_SUCCESS) {
+                    vm_deallocate(mach_task_self(), mirrored, len);
+                    munmap(memoryLoadedFile, len);
+                    munmap(map, len);
+                    return MAP_FAILED;
+                }
                 memcpy((void*)mirrored, memoryLoadedFile, len);
                 vm_deallocate(mach_task_self(), mirrored, len);
+            } else {
+                munmap(memoryLoadedFile, len);
+                munmap(map, len);
+                return MAP_FAILED;
             }
         }
         munmap(memoryLoadedFile, len);
+
+        /*
+         * The initial prepare happens before dyld copies the file bytes into
+         * the writable mirror. Re-submit the final bytes page by page so TXM
+         * trusts the actual image contents rather than the preparation marker.
+         */
+        if (has_txm) {
+            const size_t page_size = (size_t)getpagesize();
+            size_t prepared = 0u;
+            while (prepared < len) {
+                const size_t chunk = ais_executable_reprepare_chunk_length(
+                    len - prepared,
+                    page_size);
+                if (chunk == 0u) {
+                    break;
+                }
+                JIT26PrepareRegionForPatching(
+                    (void *)((uintptr_t)map + prepared),
+                    chunk);
+                prepared += chunk;
+            }
+        }
     }
     return map;
 }
@@ -246,24 +321,18 @@ void init_bypassDyldLibValidation() {
 
     NSDebugLog(@"[DyldLVBypass] init");
     
-    // The original switch used exact bitmask matching, so a device with
-    // IS_IOS_26 + HAS_TXM (no FORCE_MIRRORED) — i.e. a normal iPhone 17 on
-    // iOS 26 with StikDebug-provided JIT — fell through to redirectFunction
-    // Direct, whose vm_protect(RX) call iOS 26 blocks. The half-applied
-    // patch left dyld code pages RW with modified bytes, then dyld faulted
-    // executing non-X memory on the next mmap call → SIGBUS ignored → hang
-    // at dlopen(libjli). Use bitmask checks so iOS 26 + TXM correctly picks
-    // the mirrored variant.
-    if (DeviceHasJITFlags(JIT_FLAG_HAS_TXM) &&
-        (DeviceHasJITFlags(JIT_FLAG_IS_IOS_26) || DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED))) {
-        NSDebugLog(@"[DyldLVBypass] Using redirectFunctionMirrored");
-        redirectFunction = redirectFunctionMirrored;
-    } else if (DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED)) {
+    /* FORCE_MIRRORED describes the non-TXM shared-cache case and must avoid
+     * modifying dyld code pages. TXM devices use the mirrored path even when
+     * a basic RX mapping probe succeeds through Universal JIT. */
+    if (DeviceHasJITFlags(JIT_FLAG_FORCE_MIRRORED)) {
         // Special special case for non-TXM iOS 26+. We can JIT without
         // script, but we cannot modify existing code in dsc without it.
         // Use hardware breakpoint to avoid patching dsc code at all.
         NSDebugLog(@"[DyldLVBypass] Using redirectFunctionHWBreakpoint");
         redirectFunction = redirectFunctionHWBreakpoint;
+    } else if (DeviceHasJITFlags(JIT_FLAG_HAS_TXM)) {
+        NSDebugLog(@"[DyldLVBypass] Using redirectFunctionMirrored");
+        redirectFunction = redirectFunctionMirrored;
     } else {
         NSDebugLog(@"[DyldLVBypass] Using redirectFunctionDirect");
         redirectFunction = redirectFunctionDirect;
@@ -275,9 +344,13 @@ void init_bypassDyldLibValidation() {
     
     orig_fcntl = __fcntl;
     char *dyldBase = getDyldBase();
+    if (dyldBase == NULL) {
+        NSLog(@"[DyldLVBypass] dyld base not found");
+        return;
+    }
     //redirectFunction("mmap", mmap, hooked_mmap);
     //redirectFunction("fcntl", fcntl, hooked_fcntl);
-    searchAndPatch("dyld_mmap", dyldBase, mmapSig, sizeof(mmapSig), hooked_mmap);
+    (void)searchAndPatch("dyld_mmap", dyldBase, mmapSig, sizeof(mmapSig), hooked_mmap);
     bool fcntlPatchSuccess = searchAndPatch("dyld_fcntl", dyldBase, fcntlSig, sizeof(fcntlSig), hooked___fcntl);
     
     // https://github.com/LiveContainer/LiveContainer/commit/c978e62
@@ -301,7 +374,7 @@ void init_bypassDyldLibValidation() {
             int32_t offset = ((int32_t)((*inst)<<6))>>4;
             NSLog(@"[DyldLVBypass] Dopamine hook offset = %x", offset);
             orig_fcntl = (void*)((char*)fcntlAddr + offset);
-            redirectFunction("dyld_fcntl (Dopamine)", fcntlAddr, hooked___fcntl);
+            fcntlPatchSuccess = redirectFunction("dyld_fcntl (Dopamine)", fcntlAddr, hooked___fcntl);
         } else {
             NSLog(@"[DyldLVBypass] Dopamine hook not found");
         }
